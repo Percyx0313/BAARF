@@ -27,7 +27,7 @@ class BAradianceField(torch.nn.Module):
         n_levels: int = 16,
         n_features_per_level: int = 2, 
         log2_hashmap_size: int = 19,
-        base_resolution: int = 14,
+        base_resolution: int = 32,
         max_resolution: int = 4096,
         use_viewdirs: bool = True,
         c2f: typing.Optional[float] = None,
@@ -40,6 +40,7 @@ class BAradianceField(torch.nn.Module):
         
         self.num_frame = num_frame
         self.use_viewdirs = use_viewdirs
+        print("base resolution: ", base_resolution)
         self.nerf = NGPRadianceField(aabb=aabb, 
                                      num_dim=num_input_dim,
                                      num_layers=num_layers,
@@ -50,7 +51,8 @@ class BAradianceField(torch.nn.Module):
                                      base_resolution=base_resolution,
                                      n_features_per_level=n_features_per_level,
                                      max_resolution=max_resolution,                              
-                                     use_viewdirs=use_viewdirs)
+                                     use_viewdirs=use_viewdirs,
+                                     c2f=c2f)
         self.c2f = c2f
 
         # noise addition for blender.
@@ -148,4 +150,5 @@ class BAradianceField(torch.nn.Module):
 
     def update_progress(self, progress):
         self.progress.data.fill_(progress)
+        self.nerf.progress.data.fill_(progress)
 
