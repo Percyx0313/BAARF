@@ -27,7 +27,7 @@ class BAradianceField(torch.nn.Module):
         n_levels: int = 16,
         n_features_per_level: int = 2, 
         log2_hashmap_size: int = 19,
-        base_resolution: int = 32,
+        base_resolution: int = 14,
         max_resolution: int = 4096,
         use_viewdirs: bool = True,
         c2f: typing.Optional[float] = None,

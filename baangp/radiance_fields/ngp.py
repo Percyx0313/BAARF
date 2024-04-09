@@ -190,8 +190,8 @@ class NGPRadianceField(torch.nn.Module):
         )
     def query_density(self, x, weights:torch.Tensor = None, return_feat: bool = False):
         
-        PE_x=self.positional_encoding(x.view(-1, self.num_dim),4)
-        PE_x=torch.cat([x,PE_x],dim=-1)
+        # PE_x=self.positional_encoding(x.view(-1, self.num_dim),4)
+        # PE_x=torch.cat([x,PE_x],dim=-1)
         aabb_min, aabb_max = torch.split(self.aabb, self.num_dim, dim=-1)
         x = (x - aabb_min) / (aabb_max - aabb_min) # normalize
         encoded_x = self.encoding(x.view(-1, self.num_dim)) # [N,32]
@@ -208,42 +208,22 @@ class NGPRadianceField(torch.nn.Module):
             coarse_features = available_features[:, -self.n_features_per_level:]
             coarse_repeats = coarse_features.repeat(1, self.n_levels)
             encoded_x = encoded_x * weights + coarse_repeats * (1 - weights) 
-            # if len(available_features)>=4:
-            #     encoded_x[:,len(available_features)-2:]=encoded_x[:,len(available_features)-2:]+(encoded_x[:,len(available_features)-4:len(available_features)-2].view(-1,2) * weights)
-        
-        # c2f_start, c2f_end = self.c2f
-        # alpha = torch.floor(((self.progress.data - c2f_start) / (c2f_end - c2f_start) * (self.n_levels-1)).clamp_(min=0., max=self.n_levels-1))
-        
-        # smooth_encode=self.smooth_mlp(PE_x)
-        # if self.progress.data<0.5:
-            # if alpha.long()<self.n_levels-1:
-            #     self.consistency_loss=((encoded_x[:,alpha.long()].view(-1,1)-encoded_x[:,alpha.long()+1:])**2).mean()
-            # self.consistency_loss=((encoded_x[:,:-1]-encoded_x[:,1:])**2).mean()
-            # print(self.consistency_loss)
-            # exit()
-        # weight_matrix=random_weight_matrix(1-self.progress.data,alpha)
-        # encoded_x=encoded_x@weight_matrix.T
-        # self.hash_feat_loss=0#(encoded_x**2).mean()
-            # consist_matrix=consistency_weight_matrix(weights)
+
         x = (
             self.mlp_base(encoded_x)
             .view(list(x.shape[:-1]) + [1 + self.geo_feat_dim])
             .to(x)
         )
         
-        
-        # smooth_before_activation, smooth_mlp_out = torch.split(
-        #     smooth_encode, [1, self.geo_feat_dim], dim=-1
-        # )
-        
+
         density_before_activation, base_mlp_out = torch.split(
             x, [1, self.geo_feat_dim], dim=-1
         )
         density = (
-            self.density_activation(density_before_activation)#*self.density_activation(smooth_before_activation)
+            self.density_activation(density_before_activation)
         )
         if return_feat:
-            return density, base_mlp_out#+smooth_mlp_out
+            return density, base_mlp_out
         else:
             return density
 

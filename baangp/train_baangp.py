@@ -31,6 +31,100 @@ from utils import (
 )
 import visualization_utils as viz
 
+import wandb
+def validate(models , train_dataset, test_dataset):
+    models["radiance_field"].eval()
+    models["estimator"].eval()
+    models['radiance_field'].testing = True
+
+    with torch.no_grad():
+        pose_refine = se3_to_SE3(models["radiance_field"].se3_refine.weight)
+        gt_poses = train_dataset.camfromworld
+        pred_poses = compose_poses([pose_refine, models["radiance_field"].pose_noise, gt_poses])
+        pose_aligned, sim3 = prealign_cameras(pred_poses, gt_poses)
+        error = evaluate_camera_alignment(pose_aligned, gt_poses)
+        rot_error = np.rad2deg(error.R.mean().item())
+        trans_error = error.t.mean().item()
+        print("--------------------------")
+        print("{} train rot error:   {:8.3f}".format(step, rot_error)) # to use numpy, the value needs to be on cpu first.
+        print("{} train trans error: {:10.5f}".format(step, trans_error))
+        print("--------------------------")
+        # dump numbers
+    
+        pose_aligned_detached, gt_poses_detached = pose_aligned.detach().cpu(), gt_poses.detach().cpu()
+        fig = plt.figure(figsize=(10, 10))
+        cam_dir = os.path.join(args.save_dir, "poses")
+        os.makedirs(cam_dir, exist_ok=True)
+        png_fname = viz.plot_save_poses_blender(fig=fig,
+                                                pose=pose_aligned_detached, 
+                                                pose_ref=gt_poses_detached, 
+                                                path=cam_dir, 
+                                                ep=step)
+    
+    # evaluate novel view synthesis
+    test_dir = os.path.join(args.save_dir, "test_pred_view")
+    os.makedirs(test_dir,exist_ok=True)
+    ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+    ms_ssim = MultiScaleStructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+    res = []
+    for i in tqdm.tqdm([27]):
+        data = test_dataset[i]
+        gt_poses, pose_refine_test = evaluate_test_time_photometric_optim(
+            radiance_field=models["radiance_field"], estimator=models["estimator"],
+            render_step_size=render_step_size,
+            cone_angle=cone_angle,
+            data=data, 
+            sim3=sim3, lr_pose=optim_lr_pose, test_iter=100,
+            alpha_thre=alpha_thre,
+            device=device,
+            near_plane=near_plane,
+            far_plane=far_plane,
+            )
+        with torch.no_grad():
+            rays = models["radiance_field"].query_rays(idx=None,
+                                                       sim3=sim3, 
+                                                       gt_poses=gt_poses, 
+                                                       pose_refine_test=pose_refine_test, 
+                                                       mode='eval',
+                                                       test_photo=True,
+                                                       grid_3D=data['grid_3D'])
+            # rendering
+            rgb, opacity, depth, _ = render_image_with_occgrid(
+                # scene
+                radiance_field=models["radiance_field"],
+                estimator=models["estimator"],
+                rays=rays,
+                # rendering options
+                near_plane=near_plane,
+                far_plane=far_plane,
+                render_step_size=render_step_size,
+                render_bkgd = data["color_bkgd"],
+                cone_angle=cone_angle,
+                alpha_thre=alpha_thre,
+            )
+            # evaluate view synthesis
+            invdepth = 1/ depth
+            loaded_pixels = data["pixels"]
+            h, w, c = loaded_pixels.shape
+            pixels = loaded_pixels.permute(2, 0, 1)
+            rgb_map = rgb.view(h, w, 3).permute(2, 0, 1)
+            invdepth_map = invdepth.view(h, w)[None,:,:]
+            # mse = F.mse_loss(rgb_map, pixels)
+            # psnr = (-10.0 * torch.log(mse) / np.log(10.0)).item()
+            # ssim_val = ssim(rgb_map[None, ...], pixels[None, ...]).item()
+            # ms_ssim_val = ms_ssim(rgb_map[None, ...], pixels[None, ...]).item()
+            # lpips_loss_val = lpips_fn(rgb, loaded_pixels).item()
+            # res.append(edict(psnr=psnr, ssim=ssim_val, ms_ssim=ms_ssim_val, lpips=lpips_loss_val))
+            # dump novel views
+            rgb_map_cpu = rgb_map.cpu()
+            # gt_map_cpu = pixels.cpu()
+            depth_map_cpu = invdepth_map.cpu()
+            rgb_map_cpu=torchvision_F.to_pil_image(rgb_map_cpu)#.save("{}/rgb_{}.png".format(test_dir,i))
+            depth_map_cpu=torchvision_F.to_pil_image(depth_map_cpu)#.save("{}/depth_{}.png".format(test_dir,i))
+    models["radiance_field"].train()
+    models["estimator"].train()
+    models['radiance_field'].testing = False
+    return rot_error,trans_error,rgb_map_cpu,depth_map_cpu
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -107,6 +201,19 @@ if __name__ == "__main__":
     alpha_thre = 0.0
     cone_angle = 0.0
 
+    
+    # init wandb
+    wandb.init(config=args,
+               project="baangp",
+               dir=args.save_dir,
+               name=args.save_dir.split('/')[-2],
+               tags=args.scene,
+               job_type="training",
+               reinit=True,
+               mode='disabled')
+    
+    
+    
     train_dataset = SubjectLoader(
         subject_id=args.scene,
         root_fp=args.data_root,
@@ -235,7 +342,9 @@ if __name__ == "__main__":
                 train_dataset.update_num_rays(num_rays)
 
             # compute loss
-            loss = F.smooth_l1_loss(rgb, pixels)
+            #consistency_loss = models["radiance_field"].nerf.consistency_loss
+            # feat_reg= models["radiance_field"].nerf.hash_feat_loss
+            loss = F.smooth_l1_loss(rgb, pixels)#+0.001*feat_reg#+consistency_loss
             # do not unscale it because we are using Adam.
             scaled_train_loss = grad_scaler.scale(loss)
             scaled_train_loss.backward()
@@ -245,16 +354,35 @@ if __name__ == "__main__":
                 schedulers[key].step()
             loader.set_postfix(it=step, loss="{:.4f}".format(scaled_train_loss[0]))
 
-            if step % 10000 == 0:
+            if step % 200 == 0:
+                
                 elapsed_time = time.time() - tic
                 loss = F.mse_loss(rgb, pixels)
                 psnr = -10.0 * torch.log(loss) / np.log(10.0)
-                print(
-                    f"elapsed_time={elapsed_time:.2f}s | step={step} | "
-                    f"loss={loss:.5f} | psnr={psnr:.2f} | "
-                    f"n_rendering_samples={n_rendering_samples:d} | num_rays={len(pixels):d} | "
-                    f"max_depth={depth.max():.3f} | "
-                )
+                wandb.log({
+                    "render_loss": loss,
+                    "PSNR": psnr,
+                    #"feat_reg" : feat_reg
+                },step=step)
+
+                if step % 1000==0:
+                    print(
+                        f"elapsed_time={elapsed_time:.2f}s | step={step} | "
+                        f"loss={loss:.5f} | psnr={psnr:.2f} | "
+                        f"n_rendering_samples={n_rendering_samples:d} | num_rays={len(pixels):d} | "
+                        f"max_depth={depth.max():.3f} | "
+                    )
+                    
+                    
+                    # show the pose and render image with depth and rgb
+                    rot_error,trans_error,rgb_map_cpu,depth_map_cpu=validate(models , train_dataset, test_dataset)
+                    wandb.log({
+                        "rot_error": rot_error,
+                        "trans_error": trans_error,
+                        "rgb&&depth": [wandb.Image(rgb_map_cpu),wandb.Image(depth_map_cpu)]
+                    },step=step)
+                    
+                    
         save_ckpt(save_dir=args.save_dir, iteration=step, models=models, optimizers=optimizers, schedulers=schedulers, final=True)
     else:
         step = iteration
