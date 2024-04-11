@@ -18,8 +18,8 @@ sys.path.append("..")
 from camera_utils import img2cam
 from lie_utils import se3_to_SE3
 from pose_utils import to_hom, construct_pose, compose_poses, invert_pose
-
-
+import kornia
+from icecream import ic
 def parse_raw_camera(pose_raw):
     """Convert pose from camera_to_world to world_to_camera and follow the right, down, forward coordinate convention."""
     pose_flip = construct_pose(R=torch.diag(torch.tensor([1,-1,-1]))) # right, up, backward --> right down, forward
@@ -61,6 +61,25 @@ def _load_renderings(root_fp: str, subject_id: str, split: str, factor: float):
         images.append(rgba)
 
     images = torch.from_numpy(np.stack(images, axis=0)).to(torch.uint8)
+    
+    # images_parimid=kornia.geometry.transform.build_pyramid(images.permute(0,3,1,2)/255., 4, border_type='replicate', align_corners=False)
+    # for i,img in enumerate(images_parimid):
+    #     # save the img
+    #     img = img.clone().permute(0,2,3,1).cpu().numpy()
+    #     img = (img*255).astype(np.uint8)
+    #     ic(img.shape)
+    #     imageio.imwrite(f'test_{i}.png', img[0,:,:,:3])
+        
+    #     ic(torch.FloatTensor(images_parimid[i]).shape)
+    #     ic(images_parimid[0].shape)
+    #     resize_img=kornia.geometry.transform.resize(torch.FloatTensor(images_parimid[i]),size=(images_parimid[0].shape[2],images_parimid[0].shape[3]))
+    #     ic(resize_img.shape)
+    #     imageio.imwrite(f'resize_test_{i}.png', resize_img[0,:3,:,:].squeeze().permute(1,2,0).cpu().numpy())
+    # ic(images_parimid.shape)
+    
+    
+    # exit()
+    
     camfromworld = torch.stack(camfromworld)
 
     h, w = images.shape[1:3]
@@ -124,6 +143,10 @@ class SubjectLoader(torch.utils.data.Dataset):
             images, camfromworld, self.focal = _load_renderings(
                 root_fp, subject_id, split, factor=factor
             )
+            
+        self.pyramid_level=4
+        self.images_parimid=kornia.geometry.transform.build_pyramid(images.permute(0,3,1,2)/255., self.pyramid_level, border_type='replicate')
+        
         assert images.shape[1:3] == (self.RAW_HEIGHT//factor, self.RAW_WIDTH//factor)
         self.width, self.height = images.shape[1:3]
         K = torch.tensor(
@@ -141,7 +164,36 @@ class SubjectLoader(torch.utils.data.Dataset):
         self.training = (self.num_rays is not None) and (
             split in ["train", "trainval"]
         )
-
+        
+        self.progress=None
+    def change_pyramid_img(self,level):
+        '''
+        level : [0,1,2,3]
+        '''
+        # ic(self.images.shape)
+        # ic(self.images.max())
+        # ic(self.images_parimid[level].shape)
+        self.progress=0
+        if level>0:
+            upscale_image=kornia.geometry.transform.resize(torch.FloatTensor(self.images_parimid[level]),size=(self.images_parimid[0].shape[2],\
+                self.images_parimid[0].shape[3]))
+        else:
+            upscale_image=self.images_parimid[level]
+        upper_level=level+1 if level<self.pyramid_level-1 else level
+        upper_upscale_image=kornia.geometry.transform.resize(torch.FloatTensor(self.images_parimid[upper_level]),size=(self.images_parimid[0].shape[2],\
+                self.images_parimid[0].shape[3]))
+        
+        # ic(upscale_image.shape)
+        device=self.images.device
+        self.images=self.images.to('cpu')
+        self.images=upscale_image.to(device).permute(0,2,3,1)*255.
+        self.upper_level_images=upper_upscale_image.to(device).permute(0,2,3,1)*255.
+        # ic(self.images.max())
+        
+        # ic(self.images.shape)
+        imageio.imwrite(f'resize_test_{0}.png', self.images[0,:,:,:3].squeeze().cpu().numpy())
+        imageio.imwrite(f'resize_test_{1}.png', self.images[1,:,:,:3].squeeze().cpu().numpy())
+        # exit()
     def __len__(self):
         return len(self.images)
 
@@ -223,7 +275,11 @@ class SubjectLoader(torch.utils.data.Dataset):
         # self.K is of shape [3,3]
         grid_3D = img2cam(to_hom(xy_grid), self.K) # [B, 2], [3, 3] -> [B, 3]
         images = self.images
+        
+        
         rgba = images[image_id, y, x] / 255.0
+        if self.training and self.progress is not None:
+            rgba= self.progress*rgba+(1- self.progress)*self.upper_level_images[image_id, y, x] / 255.0
 
         w2c = torch.reshape(self.camfromworld[image_id], (-1, 3, 4)) # [3, 4] or (num_rays, 3, 4)
         if self.training:

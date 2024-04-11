@@ -161,6 +161,8 @@ if __name__ == "__main__":
         nargs="+",
         action="extend"
     )
+    
+    
 
     parser.add_argument("--save-dir", type=str,
         required=True,
@@ -201,7 +203,9 @@ if __name__ == "__main__":
     alpha_thre = 0.0
     cone_angle = 0.0
 
-    
+    #
+    ema_alpha=0.7
+    ema_ratio=(0.99/ema_alpha)**(1/max_steps)
     # init wandb
     wandb.init(config=args,
                project="baangp",
@@ -243,6 +247,7 @@ if __name__ == "__main__":
         roi_aabb=aabb, resolution=grid_resolution, levels=grid_nlvl
     ).to(device)
 
+
     # setup the radiance field we want to train.
     grad_scaler = torch.cuda.amp.GradScaler(2**10)
     
@@ -265,7 +270,7 @@ if __name__ == "__main__":
     schedulers={"scheduler": scheduler}
     optimizers={"optimizer": optimizer}
 
-    pose_optimizer = torch.optim.Adam(models['radiance_field'].se3_refine.parameters(), lr=lr_pose)
+    pose_optimizer = torch.optim.AdamW(models['radiance_field'].se3_refine.parameters(), lr=lr_pose)
     pose_scheduler = torch.optim.lr_scheduler.ExponentialLR(
         pose_optimizer,
         gamma=(lr_pose_end/lr_pose)**(1./max_steps)
@@ -280,6 +285,10 @@ if __name__ == "__main__":
 
     models, optimizers, schedulers, epoch, iteration, has_checkpoint = load_ckpt(save_dir=args.save_dir, models=models, optimizers=optimizers, schedulers=schedulers)
     # training
+    current_pyramid_level=3
+    train_dataset.change_pyramid_img(level=current_pyramid_level)
+    print(f"Update pyramid level to {current_pyramid_level}")
+    
     if not has_checkpoint:
         tic = time.time()
         loader = tqdm.trange(max_steps + 1, desc="training", leave=False)
@@ -287,6 +296,14 @@ if __name__ == "__main__":
             models['radiance_field'].train()
             models["estimator"].train()
 
+            
+            if step//2500>(3-current_pyramid_level) and current_pyramid_level>0:
+                current_pyramid_level-=1
+                train_dataset.change_pyramid_img(level=current_pyramid_level)
+                print(f"Update pyramid level to {current_pyramid_level}")
+            train_dataset.progress = min(train_dataset.progress+1/2500,1)
+            
+            
             i = torch.randint(0, len(train_dataset), (1,)).item()
             data = train_dataset[i]
 
@@ -344,7 +361,13 @@ if __name__ == "__main__":
             # compute loss
             #consistency_loss = models["radiance_field"].nerf.consistency_loss
             # feat_reg= models["radiance_field"].nerf.hash_feat_loss
+            
+            
             loss = F.smooth_l1_loss(rgb, pixels)#+0.001*feat_reg#+consistency_loss
+            
+            old_pose=models["radiance_field"].se3_refine.weight.clone()
+                
+                
             # do not unscale it because we are using Adam.
             scaled_train_loss = grad_scaler.scale(loss)
             scaled_train_loss.backward()
@@ -354,6 +377,12 @@ if __name__ == "__main__":
                 schedulers[key].step()
             loader.set_postfix(it=step, loss="{:.4f}".format(scaled_train_loss[0]))
 
+            # EMA pose
+            
+            with torch.no_grad():
+                ema_alpha*=ema_ratio
+                models["radiance_field"].se3_refine.weight.data=((1-ema_alpha)*models["radiance_field"].se3_refine.weight+ema_alpha*old_pose)
+            
             if step % 200 == 0:
                 
                 elapsed_time = time.time() - tic
@@ -382,7 +411,8 @@ if __name__ == "__main__":
                         "rgb&&depth": [wandb.Image(rgb_map_cpu),wandb.Image(depth_map_cpu)]
                     },step=step)
                     
-                    
+                # if step==6000:
+                #     exit()
         save_ckpt(save_dir=args.save_dir, iteration=step, models=models, optimizers=optimizers, schedulers=schedulers, final=True)
     else:
         step = iteration
