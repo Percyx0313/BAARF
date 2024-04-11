@@ -162,6 +162,10 @@ if __name__ == "__main__":
         action="extend"
     )
     
+    parser.add_argument(
+        "--wandb",
+        action="store_true",
+    )
     
 
     parser.add_argument("--save-dir", type=str,
@@ -207,14 +211,20 @@ if __name__ == "__main__":
     ema_alpha=0.7
     ema_ratio=(0.99/ema_alpha)**(1/max_steps)
     # init wandb
+    
+    wandb_tag = []
+    
+    
+    
+    
     wandb.init(config=args,
                project="baangp",
                dir=args.save_dir,
-               name=args.save_dir.split('/')[-2],
+               name=('/').join(args.save_dir.split('/')[-2:]),
                tags=args.scene,
                job_type="training",
                reinit=True,
-               mode='disabled')
+               mode= "online" if args.wandb else "disabled")
     
     
     
@@ -375,7 +385,7 @@ if __name__ == "__main__":
                 optimizers[key].step()
             for key in schedulers:
                 schedulers[key].step()
-            loader.set_postfix(it=step, loss="{:.4f}".format(scaled_train_loss[0]))
+            loader.set_postfix(it=step, loss="{:.4f}".format(scaled_train_loss.item()))
 
             # EMA pose
             

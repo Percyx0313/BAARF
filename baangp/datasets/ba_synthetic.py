@@ -191,8 +191,8 @@ class SubjectLoader(torch.utils.data.Dataset):
         # ic(self.images.max())
         
         # ic(self.images.shape)
-        imageio.imwrite(f'resize_test_{0}.png', self.images[0,:,:,:3].squeeze().cpu().numpy())
-        imageio.imwrite(f'resize_test_{1}.png', self.images[1,:,:,:3].squeeze().cpu().numpy())
+        imageio.imwrite(f'resize_test_{0}.png', self.images[0,:,:,:3].squeeze().cpu().numpy().astype(np.uint8))
+        imageio.imwrite(f'resize_test_{1}.png', self.images[1,:,:,:3].squeeze().cpu().numpy().astype(np.uint8))
         # exit()
     def __len__(self):
         return len(self.images)
