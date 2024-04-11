@@ -32,6 +32,40 @@ from utils import (
 import visualization_utils as viz
 
 import wandb
+from icecream import ic
+
+@torch.no_grad()
+def save_camera_poses(args,train_dataset,outlier_ids : list =None):
+    pose_refine = se3_to_SE3(models["radiance_field"].se3_refine.weight)
+    gt_poses = train_dataset.camfromworld
+    pred_poses = compose_poses([pose_refine, models["radiance_field"].pose_noise, gt_poses])
+    pose_aligned, sim3 = prealign_cameras(pred_poses, gt_poses)
+    error = evaluate_camera_alignment(pose_aligned, gt_poses)
+    rot_error = np.rad2deg(error.R.mean().item())
+    trans_error = error.t.mean().item()
+    print("--------------------------")
+    print("{} train rot error:   {:8.3f}".format(step, rot_error)) # to use numpy, the value needs to be on cpu first.
+    print("{} train trans error: {:10.5f}".format(step, trans_error))
+    print("--------------------------")
+    # dump numbers
+
+    pose_aligned_detached, gt_poses_detached = pose_aligned.detach().cpu(), gt_poses.detach().cpu()
+    fig = plt.figure(figsize=(10, 10))
+    cam_dir = os.path.join(args.save_dir, "poses")
+    os.makedirs(cam_dir, exist_ok=True)
+    png_fname = viz.plot_save_poses_blender(fig=fig,
+                                            pose=pose_aligned_detached, 
+                                            pose_ref=gt_poses_detached, 
+                                            path=cam_dir, 
+                                            ep=step,
+                                            outlier=outlier_ids)
+
+# def relocalize(args,models,img_idx):
+#     # perform relocalization for the bad image
+    
+    
+    
+    
 def validate(models , train_dataset, test_dataset):
     models["radiance_field"].eval()
     models["estimator"].eval()
@@ -237,6 +271,12 @@ if __name__ == "__main__":
         device=device,
         **train_dataset_kwargs,
     )
+    
+    
+    # re-localization 
+    re_localize_error_list=torch.zeros(len(train_dataset),device=device)
+    
+    
     print("Found %d train images"%len(train_dataset.images))
     print("Train image shape", train_dataset.images.shape)
     print("Setup the test dataset.")
@@ -373,11 +413,24 @@ if __name__ == "__main__":
             # feat_reg= models["radiance_field"].nerf.hash_feat_loss
             
             
+            
+            
+            
             loss = F.smooth_l1_loss(rgb, pixels)#+0.001*feat_reg#+consistency_loss
             
             old_pose=models["radiance_field"].se3_refine.weight.clone()
                 
-                
+            # update the relocalization error 
+            # ic(loss.item())
+            
+            re_localize_error_list[image_ids]+=(((rgb-pixels).detach())**2).mean(dim=1)
+            
+            if(step%500==0):
+                ic("the max error camera is : ",re_localize_error_list.argmax().item())
+                save_camera_poses(args,train_dataset,outlier_ids=[re_localize_error_list.argmax().item()])
+
+            
+            
             # do not unscale it because we are using Adam.
             scaled_train_loss = grad_scaler.scale(loss)
             scaled_train_loss.backward()

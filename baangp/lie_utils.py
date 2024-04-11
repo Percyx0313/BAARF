@@ -36,7 +36,11 @@ def se3_to_SE3(wu): # [...,3]
     C = taylor_C(theta)
     R = I+A*wx+B*wx@wx
     V = I+B*wx+C*wx@wx
-    Rt = torch.cat([R,(V@u[...,None])],dim=-1)
+    # lie algebra
+    # Rt = torch.cat([R,(V@u[...,None])],dim=-1)
+    # rigid lie algebra
+    Rt = torch.cat([R,(u[...,None])],dim=-1)
+    
     return Rt
 
 def SE3_to_se3(Rt,eps=1e-8): # [...,3,4]
@@ -48,7 +52,10 @@ def SE3_to_se3(Rt,eps=1e-8): # [...,3,4]
     A = taylor_A(theta)
     B = taylor_B(theta)
     invV = I-0.5*wx+(1-A/(2*B))/(theta**2+eps)*wx@wx
-    u = (invV@t)[...,0]
+    # lie algebra
+    # u = (invV@t)[...,0]
+    # rigid lie algebra
+    u = t
     wu = torch.cat([w,u],dim=-1)
     return wu    
 
