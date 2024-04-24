@@ -492,7 +492,7 @@ if __name__ == "__main__":
             
             if(step%5000==0 and step!=0):
                 train_dataset.outlier_idx=None
-                
+                viz.plot_images_blender(train_dataset, outlier_id, models, args.save_dir, step)
                 # visualize the outlier pose
                 save_camera_poses(args,train_dataset,outlier_ids=[outlier_id],path="poses_outlier_before")
                 # parallel camera pose hypothesys
