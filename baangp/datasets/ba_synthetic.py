@@ -145,7 +145,7 @@ class SubjectLoader(torch.utils.data.Dataset):
             )
             
         self.pyramid_level=4
-        self.images_parimid=kornia.geometry.transform.build_pyramid(images.permute(0,3,1,2)/255., self.pyramid_level, border_type='replicate')
+        self.images_parimid=kornia.geometry.transform.build_pyramid(images.permute(0,3,1,2)/255., self.pyramid_level, border_type='replicate',align_corners=True)
         
         assert images.shape[1:3] == (self.RAW_HEIGHT//factor, self.RAW_WIDTH//factor)
         self.width, self.height = images.shape[1:3]
@@ -164,8 +164,11 @@ class SubjectLoader(torch.utils.data.Dataset):
         self.training = (self.num_rays is not None) and (
             split in ["train", "trainval"]
         )
+        self.hypothesis_test=False
+        self.hypothesis_cam_num=64
         
         self.progress=None
+        self.outlier_idx=None
     def change_pyramid_img(self,level):
         '''
         level : [0,1,2,3]
@@ -176,12 +179,12 @@ class SubjectLoader(torch.utils.data.Dataset):
         self.progress=0
         if level>0:
             upscale_image=kornia.geometry.transform.resize(torch.FloatTensor(self.images_parimid[level]),size=(self.images_parimid[0].shape[2],\
-                self.images_parimid[0].shape[3]))
+                self.images_parimid[0].shape[3]),align_corners=True)
         else:
             upscale_image=self.images_parimid[level]
         upper_level=level+1 if level<self.pyramid_level-1 else level
         upper_upscale_image=kornia.geometry.transform.resize(torch.FloatTensor(self.images_parimid[upper_level]),size=(self.images_parimid[0].shape[2],\
-                self.images_parimid[0].shape[3]))
+                self.images_parimid[0].shape[3]),align_corners=True)
         
         # ic(upscale_image.shape)
         device=self.images.device
@@ -244,7 +247,16 @@ class SubjectLoader(torch.utils.data.Dataset):
     def fetch_data(self, index):
         """Fetch the data (it maybe cached for multiple batches)."""
         # Compute image coordinate grid.
-        if self.training:
+        if self.hypothesis_test==True:
+            assert self.num_rays is not None, "self.training is True, must pass in a num_rays."
+            image_id = [index]
+            x = torch.randint(
+                0, self.width, size=(self.num_rays//self.hypothesis_cam_num,), device=self.images.device
+            )
+            y = torch.randint(
+                0, self.height, size=(self.num_rays//self.hypothesis_cam_num,), device=self.images.device
+            )
+        elif self.training:
             # Randomly select num_ray images and sample one ray per image.
             # allow duplicates, so one image may have more rays.
             if self.batch_over_images:
@@ -255,6 +267,8 @@ class SubjectLoader(torch.utils.data.Dataset):
                     size=(self.num_rays,),
                     device=self.images.device,
                 )
+                if self.outlier_idx!=None:
+                    image_id[image_id==self.outlier_idx]=(self.outlier_idx+1)%len(self.images)
             else:
                 image_id = [index]
             x = torch.randint(
@@ -263,6 +277,8 @@ class SubjectLoader(torch.utils.data.Dataset):
             y = torch.randint(
                 0, self.height, size=(self.num_rays,), device=self.images.device
             )
+        
+            
         else:
             image_id = [index]
             x, y = torch.meshgrid(
@@ -270,6 +286,7 @@ class SubjectLoader(torch.utils.data.Dataset):
                 torch.arange(self.height, device=self.images.device),
                 indexing="xy",
             )
+                
         # adds 0.5 here.
         xy_grid = torch.stack([x,y],dim=-1).view(-1, 2) + 0.5 # [HW,2] or [B, N_rays, 2]
         # self.K is of shape [3,3]
@@ -279,6 +296,7 @@ class SubjectLoader(torch.utils.data.Dataset):
         
         rgba = images[image_id, y, x] / 255.0
         if self.training and self.progress is not None:
+            # ic(self.progress)
             rgba= self.progress*rgba+(1- self.progress)*self.upper_level_images[image_id, y, x] / 255.0
 
         w2c = torch.reshape(self.camfromworld[image_id], (-1, 3, 4)) # [3, 4] or (num_rays, 3, 4)

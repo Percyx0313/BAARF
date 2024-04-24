@@ -22,7 +22,7 @@ except ImportError as e:
         "pip install git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch"
     )
     exit()
-
+from icecream import ic
 
 class _TruncExp(Function):  # pylint: disable=abstract-method
     # Implementation from torch-ngp:
@@ -50,16 +50,7 @@ def random_weight_matrix(scale,alpha):
     weight_matrix=torch.nn.functional.normalize(weight_matrix,dim=1)
     print(weight_matrix)
     return weight_matrix
-# def consistency_weight_matrix(weight):
-#     weight=torch.diag(1-weight).view(32,32).to('cuda').half()
-#     weight[]
-#     # weight_matrix=torch.FloatTensor(
-#     #         [[[ (1-weight[j]) if (j in {i,i-1} and weight[i]<1) else 0 ] for j in range(32) ] for i in range(32)]
-#     #     ).view(32,32).to('cuda').half()
-#     # print(weight_matrix)
-#     exit()
-    # weight_matrix=torch.nn.functional.normalize(weight_matrix,dim=1)
-    return weight_matrix
+
 class NGPRadianceField(torch.nn.Module):
     """Instance-NGP Radiance Field"""
 
@@ -202,10 +193,19 @@ class NGPRadianceField(torch.nn.Module):
             # repeats last set of features for 0 mask levels.
         
             available_features = encoded_x[:, weights > 0]
+            
             if len(available_features) <= 0:
                 assert False, "no features are selected!"
             assert len(available_features) > 0
-            coarse_features = available_features[:, -self.n_features_per_level:]
+            
+            current_level=available_features.size(1)
+            if current_level>=4:
+                w=weights[current_level-1]
+                coarse_features = w*available_features[:, -self.n_features_per_level:] + (1-w)*available_features[:, -self.n_features_per_level-2:-self.n_features_per_level]
+            else:
+                coarse_features = available_features[:, -self.n_features_per_level:]
+            
+            
             coarse_repeats = coarse_features.repeat(1, self.n_levels)
             encoded_x = encoded_x * weights + coarse_repeats * (1 - weights) 
 
