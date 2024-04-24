@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=1
+# export CUDA_VISIBLE_DEVICES=1
 SCENE_LIST=( "hotdog" ) # "ship" "materials"    "drums"  "chair"  "mic"    "ficus"  "lego"  ) 
 for SCENE in "${SCENE_LIST[@]}"
 do

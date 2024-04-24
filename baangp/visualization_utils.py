@@ -4,14 +4,95 @@ Reference: https://github.com/chenhsuanlin/bundle-adjusting-NeRF
 
 # Copyright 2023 Intel Corporation
 # SPDX-License-Identifier: MIT License
-
+import os
 import torch
 import numpy as np
 from camera_utils import cam2world
 from easydict import EasyDict as edict
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from icecream import ic
 
+
+# New imports #############################################
+from evaluation_utils import (
+    evaluate_test_time_photometric_optim,
+    prealign_cameras
+)
+from lie_utils import se3_to_SE3
+from utils import render_image_with_occgrid
+from pose_utils import compose_poses
+import torchvision.transforms.functional as torchvision_F
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def plot_images_blender(dataset, idx, models, path, step=0, render_step_size=5e-3, alpha_thre=0.0, cone_angle=0.0, optim_lr_pose=1.e-3, near_plane=0.0, far_plane=1.0e10):
+    dataset.training = False
+    models["radiance_field"].eval()
+    models["estimator"].eval()
+    models['radiance_field'].testing = True
+
+    with torch.no_grad():
+        print("Plotting final pose alignment.")
+        pose_refine = se3_to_SE3(models["radiance_field"].se3_refine.weight)
+        gt_poses = dataset.camfromworld
+        pred_poses = compose_poses([pose_refine, models["radiance_field"].pose_noise, gt_poses])
+        _, sim3 = prealign_cameras(pred_poses, gt_poses)
+        # dump numbers
+    
+    # evaluate novel view synthesis
+    data = dataset[idx]
+    gt_poses, pose_refine_test = evaluate_test_time_photometric_optim(
+        radiance_field=models["radiance_field"], estimator=models["estimator"],
+        render_step_size=render_step_size,
+        cone_angle=cone_angle,
+        data=data, 
+        sim3=sim3, lr_pose=optim_lr_pose, test_iter=100,
+        alpha_thre=alpha_thre,
+        device=device,
+        near_plane=near_plane,
+        far_plane=far_plane,
+        )
+    with torch.no_grad():
+        rays = models["radiance_field"].query_rays( idx=None,
+                                                    sim3=sim3, 
+                                                    gt_poses=gt_poses, 
+                                                    pose_refine_test=pose_refine_test, 
+                                                    mode='eval',
+                                                    test_photo=True,
+                                                    grid_3D=data['grid_3D'])
+        # rendering
+        rgb, opacity, depth, _ = render_image_with_occgrid(
+            # scene
+            radiance_field=models["radiance_field"],
+            estimator=models["estimator"],
+            rays=rays,
+            # rendering options
+            near_plane=near_plane,
+            far_plane=far_plane,
+            render_step_size=render_step_size,
+            render_bkgd = data["color_bkgd"],
+            cone_angle=cone_angle,
+            alpha_thre=alpha_thre,
+        )
+        # evaluate view synthesis
+        invdepth = 1/ depth
+        loaded_pixels = data["pixels"]
+        h, w, c = loaded_pixels.shape
+        pixels = loaded_pixels.permute(2, 0, 1)
+        rgb_map = rgb.view(h, w, 3).permute(2, 0, 1)
+        invdepth_map = invdepth.view(h, w)
+        # dump novel views
+        rgb_map_cpu = rgb_map.cpu()
+        gt_map_cpu = pixels.cpu()
+        depth_map_cpu = invdepth_map.cpu()
+        path = os.path.join(path, "test_pred_view")
+        torchvision_F.to_pil_image(rgb_map_cpu).save(f"{path}/rgb_{step}_{idx}.png")
+        torchvision_F.to_pil_image(gt_map_cpu).save(f"{path}/rgb_GT_{step}_{idx}.png")
+        torchvision_F.to_pil_image(depth_map_cpu).save(f"{path}/depth_{step}_{idx}.png")
+    dataset.training = True
+    models["radiance_field"].train()
+    models["estimator"].train()
+    models['radiance_field'].testing = False
 
 def plot_save_poses_blender(fig, pose, pose_ref=None, path=None, ep=None, cam_depth=0.5,outlier=None,other_pose=None):
     # get the camera meshes
