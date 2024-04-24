@@ -25,12 +25,15 @@ from pose_utils import compose_poses
 from radiance_fields.baangp import BAradianceField
 from utils import (
     render_image_with_occgrid,
+    render_image_with_occgrid_and_normal,
     set_random_seed,
     load_ckpt,
     save_ckpt
 )
 import visualization_utils as viz
 from einops import rearrange
+from icecream import install
+install()
 
 import wandb
 from icecream import ic
@@ -174,7 +177,7 @@ def validate(models , train_dataset, test_dataset):
             invdepth = 1/ depth
             loaded_pixels = data["pixels"]
             h, w, c = loaded_pixels.shape
-            pixels = loaded_pixels.permute(2, 0, 1)
+            pixels = loaded_pixels.permute(2, 0, 1)  # [3, H, W]
             rgb_map = rgb.view(h, w, 3).permute(2, 0, 1)
             invdepth_map = invdepth.view(h, w)[None,:,:]
             # mse = F.mse_loss(rgb_map, pixels)
@@ -239,6 +242,8 @@ if __name__ == "__main__":
     parser.add_argument("--save-dir", type=str,
         required=True,
         help="The output root directory for saving models.")
+    
+    parser.add_argument("--eps", type=float, default=1e-4, help="eps for normal computation.")
     args = parser.parse_args()
 
     device = "cuda:0"
@@ -724,7 +729,7 @@ if __name__ == "__main__":
                                                 ep=step)
     
     # evaluate novel view synthesis
-    test_dir = os.path.join(args.save_dir, "test_pred_view")
+    test_dir = os.path.join(args.save_dir, f"test_pred_view")
     os.makedirs(test_dir,exist_ok=True)
     ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
     ms_ssim = MultiScaleStructuralSimilarityIndexMeasure(data_range=1.0).to(device)
@@ -751,7 +756,7 @@ if __name__ == "__main__":
                                                        test_photo=True,
                                                        grid_3D=data['grid_3D'])
             # rendering
-            rgb, opacity, depth, _ = render_image_with_occgrid(
+            rgb, opacity, depth, _, normal = render_image_with_occgrid_and_normal(
                 # scene
                 radiance_field=models["radiance_field"],
                 estimator=models["estimator"],
@@ -763,6 +768,7 @@ if __name__ == "__main__":
                 render_bkgd = data["color_bkgd"],
                 cone_angle=cone_angle,
                 alpha_thre=alpha_thre,
+                eps=args.eps
             )
             # evaluate view synthesis
             invdepth = 1/ depth
@@ -770,6 +776,7 @@ if __name__ == "__main__":
             h, w, c = loaded_pixels.shape
             pixels = loaded_pixels.permute(2, 0, 1)
             rgb_map = rgb.view(h, w, 3).permute(2, 0, 1)
+            normal_map = normal.view(h, w, 3).permute(2, 0, 1)
             invdepth_map = invdepth.view(h, w)
             mse = F.mse_loss(rgb_map, pixels)
             psnr = (-10.0 * torch.log(mse) / np.log(10.0)).item()
@@ -781,10 +788,11 @@ if __name__ == "__main__":
             rgb_map_cpu = rgb_map.cpu()
             gt_map_cpu = pixels.cpu()
             depth_map_cpu = invdepth_map.cpu()
+            normal_map_cpu = normal_map.cpu()
             torchvision_F.to_pil_image(rgb_map_cpu).save("{}/rgb_{}.png".format(test_dir,i))
             torchvision_F.to_pil_image(gt_map_cpu).save("{}/rgb_GT_{}.png".format(test_dir,i))
             torchvision_F.to_pil_image(depth_map_cpu).save("{}/depth_{}.png".format(test_dir,i))
-            
+            torchvision_F.to_pil_image(normal_map_cpu).save("{}/normal_{}.png".format(test_dir,i))
     plt.close()
     # show results in terminal
     avg_psnr = np.mean([r.psnr for r in res])
@@ -807,8 +815,10 @@ if __name__ == "__main__":
     print("writing videos...")
     rgb_vid_fname = os.path.join(args.save_dir, "test_view_rgb.mp4")
     depth_vid_fname = os.path.join(args.save_dir, "test_view_depth.mp4")
+    normal_vid_fname = os.path.join(args.save_dir, "test_view_normal.mp4")
     os.system("ffmpeg -y -framerate 30 -i {0}/rgb_%d.png -pix_fmt yuv420p {1} >/dev/null 2>&1".format(test_dir, rgb_vid_fname))
     os.system("ffmpeg -y -framerate 30 -i {0}/depth_%d.png -pix_fmt yuv420p {1} >/dev/null 2>&1".format(test_dir, depth_vid_fname))
+    os.system("ffmpeg -y -framerate 30 -i {0}/normal_%d.png -pix_fmt yuv420p {1} >/dev/null 2>&1".format(test_dir, normal_vid_fname))
 
     print("Training and evaluation stops.")
         
