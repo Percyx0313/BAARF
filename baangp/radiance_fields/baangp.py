@@ -13,6 +13,7 @@ from camera_utils import cam2world
 from lie_utils import se3_to_SE3
 from pose_utils import construct_pose, compose_poses
 from utils import Rays
+from icecream import ic
 
 
 class BAradianceField(torch.nn.Module):
@@ -57,7 +58,7 @@ class BAradianceField(torch.nn.Module):
 
         # noise addition for blender.
         
-        se3_noise = torch.randn(num_frame, dof, device=device) * 0.15
+        se3_noise = torch.randn(num_frame, dof, device=device) * 0
         self.pose_noise = se3_to_SE3(se3_noise)
         # Learnable embedding. 
         self.se3_refine = torch.nn.Embedding(num_frame, dof, device=device)
@@ -70,12 +71,42 @@ class BAradianceField(torch.nn.Module):
         self.device = device
         self.testing = testing
 
-    def query_density(self, x, occ_sample=False):
+    def query_density(self, x, occ_sample=False, require_normal: bool = False):
         if self.c2f is None or (self.testing and not occ_sample):
             return self.nerf.query_density(x)
         return self.nerf.query_density(x, weights=self.get_weights())
-
-
+    
+    def query_normal(self, x, occ_sample=False, eps=1e-4):
+        normal = None
+        offsets = torch.as_tensor(
+            [
+                [eps, 0, 0],
+                [-eps, 0, 0],
+                [0, eps, 0],
+                [0, -eps, 0],
+                [0, 0, eps],
+                [0, 0, -eps],
+            ]
+        ).to(x)
+        x_d = x.repeat(6, 1, 1)
+        x_d[:, :, :3] += offsets[:, None]
+        d = []
+        for i in x_d:
+            # ic(i.shape)
+            if self.c2f is None or (self.testing and not occ_sample):
+                d.append(self.nerf.query_density(i).detach().cpu().numpy())
+            else:
+                d.append(self.nerf.query_density(i, weights=self.get_weights()).detach().cpu().numpy())
+        # ic(d[0].shape)
+        d = np.array(d)
+        x_grad = (d[0] - d[1]) / eps
+        y_grad = (d[2] - d[3]) / eps
+        z_grad = (d[4] - d[5]) / eps
+        normal = np.stack([x_grad, y_grad, z_grad], axis=-1)
+        normal = torch.tensor(normal, device=x.device)
+        normal = normal.squeeze(1)
+        return normal
+    
     def get_weights(self):
         c2f_start, c2f_end = self.c2f
         # to prevent all weights to be 0, we leave the features from the first grid alone.
@@ -113,6 +144,8 @@ class BAradianceField(torch.nn.Module):
             # additionally factorize the remaining pose imperfection
             if test_photo and mode != "val":
                 poses = compose_poses([pose_refine_test, poses])
+        # TODO: Remember remove
+        poses=gt_poses
         return poses
 
     def query_rays(self, grid_3D, idx=None, sim3=None,

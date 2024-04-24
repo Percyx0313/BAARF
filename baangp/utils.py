@@ -15,10 +15,110 @@ import torch
 from nerfacc.estimators.occ_grid import OccGridEstimator
 from nerfacc.volrend import (
     rendering,
+    render_weight_from_density,
+    render_weight_from_alpha,
+    accumulate_along_rays
 )
 import collections
+from torch import Tensor
+from typing import Callable, Tuple
+from icecream import ic
+ic.configureOutput(includeContext=True)
 
 Rays = collections.namedtuple("Rays", ("origins", "viewdirs"))
+
+def rendering_with_normal(
+    # ray marching results
+    t_starts: Tensor,
+    t_ends: Tensor,
+    ray_indices: Optional[Tensor] = None,
+    n_rays: Optional[int] = None,
+    # radiance field
+    rgb_sigma_fn: Optional[Callable] = None,
+    rgb_alpha_fn: Optional[Callable] = None,
+    # rendering options
+    render_bkgd: Optional[Tensor] = None,
+) -> Tuple[Tensor, Tensor, Tensor, Dict]:
+    if ray_indices is not None:
+        assert (
+            t_starts.shape == t_ends.shape == ray_indices.shape
+        ), "Since nerfacc 0.5.0, t_starts, t_ends and ray_indices must have the same shape (N,). "
+
+    if rgb_sigma_fn is None and rgb_alpha_fn is None:
+        raise ValueError(
+            "At least one of `rgb_sigma_fn` and `rgb_alpha_fn` should be specified."
+        )
+
+    # Query sigma/alpha and color with gradients
+    if rgb_sigma_fn is not None:
+        rgbs, sigmas, normal = rgb_sigma_fn(t_starts, t_ends, ray_indices)
+        assert rgbs.shape[-1] == 3, "rgbs must have 3 channels, got {}".format(
+            rgbs.shape
+        )
+        assert (
+            sigmas.shape == t_starts.shape
+        ), "sigmas must have shape of (N,)! Got {}".format(sigmas.shape)
+        # Rendering: compute weights.
+        weights, trans, alphas = render_weight_from_density(
+            t_starts,
+            t_ends,
+            sigmas,
+            ray_indices=ray_indices,
+            n_rays=n_rays,
+        )
+        extras = {
+            "weights": weights,
+            "alphas": alphas,
+            "trans": trans,
+            "sigmas": sigmas,
+            "rgbs": rgbs,
+        }
+    elif rgb_alpha_fn is not None:
+        rgbs, alphas = rgb_alpha_fn(t_starts, t_ends, ray_indices)
+        assert rgbs.shape[-1] == 3, "rgbs must have 3 channels, got {}".format(
+            rgbs.shape
+        )
+        assert (
+            alphas.shape == t_starts.shape
+        ), "alphas must have shape of (N,)! Got {}".format(alphas.shape)
+        # Rendering: compute weights.
+        weights, trans = render_weight_from_alpha(
+            alphas,
+            ray_indices=ray_indices,
+            n_rays=n_rays,
+        )
+        extras = {
+            "weights": weights,
+            "trans": trans,
+            "rgbs": rgbs,
+            "alphas": alphas,
+        }
+
+    # Rendering: accumulate rgbs, opacities, and depths along the rays.
+    colors = accumulate_along_rays(
+        weights, values=rgbs, ray_indices=ray_indices, n_rays=n_rays
+    )
+    opacities = accumulate_along_rays(
+        weights, values=None, ray_indices=ray_indices, n_rays=n_rays
+    )
+    depths = accumulate_along_rays(
+        weights,
+        values=(t_starts + t_ends)[..., None] / 2.0,
+        ray_indices=ray_indices,
+        n_rays=n_rays,
+    )
+    normals = accumulate_along_rays(
+        weights, values=normal, ray_indices=ray_indices, n_rays=n_rays
+    )
+    depths = depths / opacities.clamp_min(torch.finfo(rgbs.dtype).eps)
+
+    # Background composition.
+    if render_bkgd is not None:
+        colors = colors + render_bkgd * (1.0 - opacities)
+        
+    extras.update({"normals": normals})
+
+    return colors, opacities, depths, extras
 
 
 def namedtuple_map(fn, tup):
@@ -31,6 +131,118 @@ def set_random_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    
+def render_image_with_occgrid_and_normal(
+    # scene
+    radiance_field: torch.nn.Module,
+    estimator: OccGridEstimator,
+    rays: Rays,
+    # rendering options
+    near_plane: float = 0.0,
+    far_plane: float = 1e10,
+    render_step_size: float = 1e-3,
+    render_bkgd: Optional[torch.Tensor] = None,
+    cone_angle: float = 0.0,
+    alpha_thre: float = 0.0,
+    # test options
+    test_chunk_size: int = 8192,
+    timestamps: Optional[torch.Tensor] = None,
+    eps: float = 1e-4,
+):
+    
+    """Render the pixels of an image."""
+    rays_shape = rays.origins.shape
+    if len(rays_shape) == 3:
+        height, width, _ = rays_shape
+        num_rays = height * width
+        rays = namedtuple_map(
+            lambda r: r.reshape([num_rays] + list(r.shape[2:])), rays
+        )
+    else:
+        num_rays, _ = rays_shape
+
+    def sigma_fn(t_starts, t_ends, ray_indices):
+        t_origins = chunk_rays.origins[ray_indices]
+        t_dirs = chunk_rays.viewdirs[ray_indices]
+        positions = t_origins + t_dirs * (t_starts + t_ends)[:, None] / 2.0
+        if timestamps is not None:
+            # dnerf
+            t = (
+                timestamps[ray_indices]
+                if radiance_field.training
+                else timestamps.expand_as(positions[:, :1])
+            )
+            sigmas = radiance_field.query_density(positions, t)
+        else:
+            sigmas = radiance_field.query_density(positions)
+        return sigmas.squeeze(-1)
+
+    def rgb_sigma_fn(t_starts, t_ends, ray_indices, require_normal = False):
+        t_origins = chunk_rays.origins[ray_indices]
+        t_dirs = chunk_rays.viewdirs[ray_indices]
+        positions = t_origins + t_dirs * (t_starts + t_ends)[:, None] / 2.0
+        if timestamps is not None:
+            # dnerf
+            t = (
+                timestamps[ray_indices]
+                if radiance_field.training
+                else timestamps.expand_as(positions[:, :1])
+            )
+            rgbs, sigmas = radiance_field(positions, t, t_dirs)
+        else:
+            rgbs, sigmas = radiance_field(positions, t_dirs)
+            normal = radiance_field.query_normal(positions, eps=eps)
+        return rgbs, sigmas.squeeze(-1), normal
+    
+    
+
+    results = []
+    chunk = (
+        torch.iinfo(torch.int32).max
+        if radiance_field.training
+        else test_chunk_size
+    )
+    for i in range(0, num_rays, chunk):
+        chunk_rays = namedtuple_map(lambda r: r[i : i + chunk], rays)
+        ray_indices, t_starts, t_ends = estimator.sampling(
+            chunk_rays.origins,
+            chunk_rays.viewdirs,
+            sigma_fn=sigma_fn,
+            near_plane=near_plane,
+            far_plane=far_plane,
+            render_step_size=render_step_size,
+            stratified=radiance_field.training,
+            cone_angle=cone_angle,
+            alpha_thre=alpha_thre,
+        )
+        
+        rgb, opacity, depth, extras = rendering_with_normal(
+            t_starts,
+            t_ends,
+            ray_indices,
+            n_rays=chunk_rays.origins.shape[0],
+            rgb_sigma_fn=rgb_sigma_fn,
+            render_bkgd=render_bkgd,
+        )
+        normal = extras['normals']
+        norm = torch.linalg.norm(normal, dim=1)
+        norm[norm == 0] = 1
+        normal = normal / norm[:, None]
+        normal = torch.abs(normal)
+        
+        chunk_results = [rgb, opacity, depth, len(t_starts), normal]
+        results.append(chunk_results)
+    colors, opacities, depths, n_rendering_samples, normals = [
+        torch.cat(r, dim=0) if isinstance(r[0], torch.Tensor) else r
+        for r in zip(*results)
+    ]
+    return (
+        colors.view((*rays_shape[:-1], -1)),
+        opacities.view((*rays_shape[:-1], -1)),
+        depths.view((*rays_shape[:-1], -1)),
+        sum(n_rendering_samples),
+        normals.view((*rays_shape[:-1], -1))
+    )
 
 
 def render_image_with_occgrid(
