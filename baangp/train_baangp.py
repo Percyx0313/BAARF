@@ -17,11 +17,12 @@ from datasets.ba_synthetic import SubjectLoader
 from evaluation_utils import (
     evaluate_camera_alignment,
     evaluate_test_time_photometric_optim,
-    prealign_cameras
+    prealign_cameras,
+    pose_evaluate
 )
-from lie_utils import se3_to_SE3
+from lie_utils import se3_to_SE3,so3_t3_to_SE3
 from nerfacc.estimators.occ_grid import OccGridEstimator
-from pose_utils import compose_poses,compose_split
+from pose_utils import compose_poses
 from radiance_fields.baangp import BAradianceField
 from utils import (
     render_image_with_occgrid,
@@ -42,7 +43,7 @@ def save_camera_poses(args,train_dataset,outlier_ids : list =None,path="poses_ou
     models["estimator"].eval()
     models['radiance_field'].testing = True
     with torch.no_grad():
-        pose_refine = se3_to_SE3(models["radiance_field"].se3_refine.weight)
+        pose_refine = so3_t3_to_SE3(models["radiance_field"].se3_refine_R.weight, models["radiance_field"].se3_refine_T.weight)
         gt_poses = train_dataset.camfromworld
         pred_poses = compose_poses([pose_refine, models["radiance_field"].pose_noise, gt_poses])
         pose_aligned, sim3 = prealign_cameras(pred_poses, gt_poses)
@@ -61,7 +62,7 @@ def save_camera_poses(args,train_dataset,outlier_ids : list =None,path="poses_ou
         if hyp_se3 is not None:
             pertubation_se3=hyp_se3.clone().detach()
             
-            pertubation_pose = se3_to_SE3(pertubation_se3.view(-1,6))
+            pertubation_pose = so3_t3_to_SE3(pertubation_se3.view(-1,6))
             # ic(pertubation_se3)
             # ic(pertubation_pose)
             # init_poses = compose_poses([models["radiance_field"].pose_noise[outlier_ids[0]].clone() , gt_poses[outlier_ids[0]].clone()])
@@ -122,13 +123,13 @@ def validate(models , train_dataset, test_dataset):
     models['radiance_field'].testing = True
 
     with torch.no_grad():
-        pose_refine = se3_to_SE3(models["radiance_field"].se3_refine.weight)
         gt_poses = train_dataset.camfromworld
-        pred_poses = compose_poses([pose_refine, models["radiance_field"].pose_noise, gt_poses])
-        pose_aligned, sim3 = prealign_cameras(pred_poses, gt_poses)
-        error = evaluate_camera_alignment(pose_aligned, gt_poses)
-        rot_error = np.rad2deg(error.R.mean().item())
-        trans_error = error.t.mean().item()
+        rot_error,trans_error,pose_aligned,sim3=\
+        pose_evaluate(models["radiance_field"].se3_refine_R.weight, 
+                      models["radiance_field"].se3_refine_T.weight,
+                      models["radiance_field"].pose_noise,
+                      gt_poses)
+        
         print("--------------------------")
         print("{} train rot error:   {:8.3f}".format(step, rot_error)) # to use numpy, the value needs to be on cpu first.
         print("{} train trans error: {:10.5f}".format(step, trans_error))
@@ -145,33 +146,29 @@ def validate(models , train_dataset, test_dataset):
                                                 path=cam_dir, 
                                                 ep=step)
     
-    # evaluate novel view synthesis
-    test_dir = os.path.join(args.save_dir, "test_pred_view")
-    os.makedirs(test_dir,exist_ok=True)
-    ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
-    ms_ssim = MultiScaleStructuralSimilarityIndexMeasure(data_range=1.0).to(device)
-    res = []
-    for i in tqdm.tqdm([27]):
-        data = test_dataset[i]
-        gt_poses, pose_refine_test = evaluate_test_time_photometric_optim(
-            radiance_field=models["radiance_field"], estimator=models["estimator"],
-            render_step_size=render_step_size,
-            cone_angle=cone_angle,
-            data=data, 
-            sim3=sim3, lr_pose=optim_lr_pose, test_iter=100,
-            alpha_thre=alpha_thre,
-            device=device,
-            near_plane=near_plane,
-            far_plane=far_plane,
-            )
-        with torch.no_grad():
+        # evaluate novel view synthesis
+        test_dir = os.path.join(args.save_dir, "test_pred_view")
+        os.makedirs(test_dir,exist_ok=True)
+        for i in tqdm.tqdm([27]):
+            data = test_dataset[i]
+            gt_poses, pose_refine_test = evaluate_test_time_photometric_optim(
+                radiance_field=models["radiance_field"], estimator=models["estimator"],
+                render_step_size=render_step_size,
+                cone_angle=cone_angle,
+                data=data, 
+                sim3=sim3, lr_pose=optim_lr_pose, test_iter=100,
+                alpha_thre=alpha_thre,
+                device=device,
+                near_plane=near_plane,
+                far_plane=far_plane,
+                )
             rays = models["radiance_field"].query_rays(idx=None,
-                                                       sim3=sim3, 
-                                                       gt_poses=gt_poses, 
-                                                       pose_refine_test=pose_refine_test, 
-                                                       mode='eval',
-                                                       test_photo=True,
-                                                       grid_3D=data['grid_3D'])
+                                                    sim3=sim3, 
+                                                    gt_poses=gt_poses, 
+                                                    pose_refine_test=pose_refine_test, 
+                                                    mode='eval',
+                                                    test_photo=True,
+                                                    grid_3D=data['grid_3D'])
             # rendering
             rgb, opacity, depth, _ = render_image_with_occgrid(
                 # scene
@@ -193,18 +190,14 @@ def validate(models , train_dataset, test_dataset):
             pixels = loaded_pixels.permute(2, 0, 1)
             rgb_map = rgb.view(h, w, 3).permute(2, 0, 1)
             invdepth_map = invdepth.view(h, w)[None,:,:]
-            # mse = F.mse_loss(rgb_map, pixels)
-            # psnr = (-10.0 * torch.log(mse) / np.log(10.0)).item()
-            # ssim_val = ssim(rgb_map[None, ...], pixels[None, ...]).item()
-            # ms_ssim_val = ms_ssim(rgb_map[None, ...], pixels[None, ...]).item()
-            # lpips_loss_val = lpips_fn(rgb, loaded_pixels).item()
-            # res.append(edict(psnr=psnr, ssim=ssim_val, ms_ssim=ms_ssim_val, lpips=lpips_loss_val))
             # dump novel views
             rgb_map_cpu = rgb_map.cpu()
-            # gt_map_cpu = pixels.cpu()
             depth_map_cpu = invdepth_map.cpu()
             rgb_map_cpu=torchvision_F.to_pil_image(rgb_map_cpu)#.save("{}/rgb_{}.png".format(test_dir,i))
             depth_map_cpu=torchvision_F.to_pil_image(depth_map_cpu)#.save("{}/depth_{}.png".format(test_dir,i))
+            rgb_map_cpu.save("{}/rgb_{}.png".format(test_dir,i))
+            depth_map_cpu.save("{}/depth_{}.png".format(test_dir,i))
+            
     models["radiance_field"].train()
     models["estimator"].train()
     models['radiance_field'].testing = False
@@ -269,8 +262,8 @@ if __name__ == "__main__":
     # training parameters
     lr = 1.e-2
     lr_end = 1.e-4
-    lr_pose = 1.e-3 #1.e-2
-    lr_pose_end = 1.e-5 #1.e-3
+    lr_pose_R = 3.e-3 #1.e-2
+    lr_pose_T = 5.e-3 #1.e-2
     optim_lr_pose = 1.e-3
     max_steps = 40000 # 20000
     init_batch_size = 1024
@@ -292,7 +285,7 @@ if __name__ == "__main__":
     cone_angle = 0.0
 
     #
-    ema_alpha=0.7
+    ema_alpha=0.9
     ema_ratio=(0.99/ema_alpha)**(1/(max_steps/4))
     # init wandb
     
@@ -370,10 +363,12 @@ if __name__ == "__main__":
     schedulers={"scheduler": scheduler}
     optimizers={"optimizer": optimizer}
 
-    pose_optimizer = torch.optim.AdamW(models['radiance_field'].se3_refine.parameters(), lr=lr_pose)
+    pose_optimizer = torch.optim.AdamW(
+        [{'params':models['radiance_field'].se3_refine_R.parameters(), 'lr':lr_pose_R},
+         {'params':models['radiance_field'].se3_refine_T.parameters(), 'lr':lr_pose_T}],betas=[0.9,0.99])
     pose_scheduler = torch.optim.lr_scheduler.ExponentialLR(
         pose_optimizer,
-        gamma=(lr_pose_end/lr_pose)**(1./max_steps)
+        gamma=(1.e-1)**(1./max_steps)
     )
     schedulers["pose_scheduler"] = pose_scheduler
     optimizers["pose_optimizer"] = pose_optimizer
@@ -459,24 +454,14 @@ if __name__ == "__main__":
                 )
                 train_dataset.update_num_rays(num_rays)
 
-            # compute loss
-            #consistency_loss = models["radiance_field"].nerf.consistency_loss
-            # feat_reg= models["radiance_field"].nerf.hash_feat_loss
-            
-            
-            
-            
             
             loss = F.smooth_l1_loss(rgb, pixels)#+0.001*feat_reg#+consistency_loss
             with torch.no_grad():
                 re_localize_error_list*=0.9
                 re_localize_error_list.index_add_(0,image_ids,0.1*torch.mean((rgb.view(-1,3)-pixels.view(-1,3))**2.,dim=-1))
-                # ic(re_localize_error_list)
-                # re_localize_error_list[image_ids]=0.9*re_localize_error_list[image_ids]+0.1*torch.mean((rgb.view(-1,3)-pixels.view(-1,3))**2.,dim=-1).detach()
-            old_pose=models["radiance_field"].se3_refine.weight.clone()
+            old_pose_R=models["radiance_field"].se3_refine_R.weight.clone()
+            old_pose_T=models["radiance_field"].se3_refine_T.weight.clone()
                 
-            # update the relocalization error 
-            # ic(loss.item())
             
             
             
@@ -497,205 +482,206 @@ if __name__ == "__main__":
             with torch.no_grad():
                 ema_alpha=min(ema_ratio*ema_alpha,0.99)
                 # ic(ema_alpha)
-                models["radiance_field"].se3_refine.weight.data=((1-ema_alpha)*models["radiance_field"].se3_refine.weight+ema_alpha*old_pose)
+                models["radiance_field"].se3_refine_R.weight.data=((1-ema_alpha)*models["radiance_field"].se3_refine_R.weight+ema_alpha*old_pose_R)
+                models["radiance_field"].se3_refine_T.weight.data=((1-ema_alpha)*models["radiance_field"].se3_refine_T.weight+ema_alpha*old_pose_T)
                 
-            if((step+50)%100==0 and step!=0):
-                ic("the max error camera is : ",re_localize_error_list.argmax().item())
-                ic(re_localize_error_list.max().item())
-                old_re_localize_error=re_localize_error_list.max().item()
-                outlier_id= re_localize_error_list.argmax().item()
-                train_dataset.outlier_idx=outlier_id
+            # if((step+50)%100==0 and step!=0):
+            #     ic("the max error camera is : ",re_localize_error_list.argmax().item())
+            #     ic(re_localize_error_list.max().item())
+            #     old_re_localize_error=re_localize_error_list.max().item()
+            #     outlier_id= re_localize_error_list.argmax().item()
+            #     train_dataset.outlier_idx=outlier_id
             
-            if((step+1)%100==0 and step!=0):
-                train_dataset.outlier_idx=None
+            # if((step+1)%100==0 and step!=0):
+            #     train_dataset.outlier_idx=None
                 
-                # visualize the outlier pose
-                save_camera_poses(args,train_dataset,outlier_ids=[outlier_id],path="poses_outlier_before")
-                # parallel camera pose hypothesys
-                filter_ratio=0.25
-                outlier_pose_id=outlier_id
-                outlier_se3=models["radiance_field"].se3_refine.weight[outlier_pose_id].clone()
+            #     # visualize the outlier pose
+            #     save_camera_poses(args,train_dataset,outlier_ids=[outlier_id],path="poses_outlier_before")
+            #     # parallel camera pose hypothesys
+            #     filter_ratio=0.25
+            #     outlier_pose_id=outlier_id
+            #     outlier_se3=models["radiance_field"].se3_refine.weight[outlier_pose_id].clone()
                 
-                Stage_number=4
-                stage_iter=512
-                hyp_lr=1.e-3
-                hyp_lr_end=1.e-4
-                hyp_grad_scaler = torch.cuda.amp.GradScaler(2**10)
+            #     Stage_number=4
+            #     stage_iter=512
+            #     hyp_lr=1.e-3
+            #     hyp_lr_end=1.e-4
+            #     hyp_grad_scaler = torch.cuda.amp.GradScaler(2**10)
                 
-                num_hypothesis=128
+            #     num_hypothesis=128
                 
-                translation_range=0
-                rotation_range=90
-                # initial hypothesis pose
-                delta_translation=translation_range*(torch.rand(num_hypothesis,3).to('cuda')-0.5)
-                delta_rotation=torch.deg2rad(rotation_range*(torch.rand(num_hypothesis,3).to('cuda')-0.5))
+            #     translation_range=0
+            #     rotation_range=90
+            #     # initial hypothesis pose
+            #     delta_translation=translation_range*(torch.rand(num_hypothesis,3).to('cuda')-0.5)
+            #     delta_rotation=torch.deg2rad(rotation_range*(torch.rand(num_hypothesis,3).to('cuda')-0.5))
                 
-                noise_term=torch.cat([delta_rotation,delta_translation],dim=-1).view(-1,6)
-                # ic(noise_term)
-                pertubation_se3=torch.nn.Parameter(outlier_se3.view(1,-1)+noise_term)
+            #     noise_term=torch.cat([delta_rotation,delta_translation],dim=-1).view(-1,6)
+            #     # ic(noise_term)
+            #     pertubation_se3=torch.nn.Parameter(outlier_se3.view(1,-1)+noise_term)
                 
                 
-                # multi_hypothesis training 
-                hyp_pose_optimizer = torch.optim.SGD([pertubation_se3], lr=hyp_lr,momentum=0.9)
+            #     # multi_hypothesis training 
+            #     hyp_pose_optimizer = torch.optim.SGD([pertubation_se3], lr=hyp_lr,momentum=0.9)
                 
-                train_dataset.hypothesis_test=True
-                # ic("ray number is ", num_rays)
-                train_dataset.hypothesis_cam_num=num_hypothesis
-                soft_epoch=4096*train_dataset.hypothesis_cam_num//num_rays
-                accumulated_loss=torch.zeros(train_dataset.hypothesis_cam_num).to('cuda')
-                # models["radiance_field"].eval()
-                for epoch in range(Stage_number):
-                    for it in tqdm.tqdm(range(stage_iter)):
-                        if (it+1)%soft_epoch==0:
-                            hyp_pose_optimizer.zero_grad(set_to_none=True)
-                        # get ray
-                        hyp_data = train_dataset[outlier_pose_id]
-                        hyp_render_bkgd = hyp_data["color_bkgd"]
-                        hyp_pixels = hyp_data["pixels"]
-                        hyp_pixels=hyp_pixels.unsqueeze(0).repeat(train_dataset.hypothesis_cam_num,1,1)
-                        hyp_grid_3D = hyp_data["grid_3D"]
-                        hyp_gt_poses = hyp_data["gt_w2c"] # [num_ray, 3, 4]
-                        hyp_image_ids = hyp_data["image_id"]
-                        # query rays
-                        pose_noises =  models["radiance_field"].pose_noise[outlier_pose_id]
-                        init_poses = compose_poses([pose_noises, hyp_gt_poses])
-                        poses_refine = se3_to_SE3(pertubation_se3) # [1, 3, 4]
-                        # add learnable pose correction
-                        poses = compose_poses([poses_refine, init_poses])
-                        # ic(pertubation_se3.requires_grad)
-                        # ic(poses_refine.requires_grad)
-                        # ic(poses.requires_grad)
-                        # given the intrinsic/extrinsic matrices, get the camera center and ray directions
-                        center_3D = torch.zeros_like(hyp_grid_3D) # [B, N, 3]
-                        # transform from camera to world coordinates
-                        # ic(hyp_grid_3D.shape,poses.shape)
-                        grid_3D = cam2world(hyp_grid_3D.squeeze().unsqueeze(0), poses) # [B, N, 3], [B, 3, 4] -> [B, 3]
-                        center_3D = cam2world(center_3D.squeeze().unsqueeze(0), poses) # [B, N, 3]
-                        directions = grid_3D - center_3D # [B, N, 3]
-                        viewdirs = directions / torch.linalg.norm(
-                            directions, dim=-1, keepdims=True
-                        )
+            #     train_dataset.hypothesis_test=True
+            #     # ic("ray number is ", num_rays)
+            #     train_dataset.hypothesis_cam_num=num_hypothesis
+            #     soft_epoch=4096*train_dataset.hypothesis_cam_num//num_rays
+            #     accumulated_loss=torch.zeros(train_dataset.hypothesis_cam_num).to('cuda')
+            #     # models["radiance_field"].eval()
+            #     for epoch in range(Stage_number):
+            #         for it in tqdm.tqdm(range(stage_iter)):
+            #             if (it+1)%soft_epoch==0:
+            #                 hyp_pose_optimizer.zero_grad(set_to_none=True)
+            #             # get ray
+            #             hyp_data = train_dataset[outlier_pose_id]
+            #             hyp_render_bkgd = hyp_data["color_bkgd"]
+            #             hyp_pixels = hyp_data["pixels"]
+            #             hyp_pixels=hyp_pixels.unsqueeze(0).repeat(train_dataset.hypothesis_cam_num,1,1)
+            #             hyp_grid_3D = hyp_data["grid_3D"]
+            #             hyp_gt_poses = hyp_data["gt_w2c"] # [num_ray, 3, 4]
+            #             hyp_image_ids = hyp_data["image_id"]
+            #             # query rays
+            #             pose_noises =  models["radiance_field"].pose_noise[outlier_pose_id]
+            #             init_poses = compose_poses([pose_noises, hyp_gt_poses])
+            #             poses_refine = se3_to_SE3(pertubation_se3) # [1, 3, 4]
+            #             # add learnable pose correction
+            #             poses = compose_poses([poses_refine, init_poses])
+            #             # ic(pertubation_se3.requires_grad)
+            #             # ic(poses_refine.requires_grad)
+            #             # ic(poses.requires_grad)
+            #             # given the intrinsic/extrinsic matrices, get the camera center and ray directions
+            #             center_3D = torch.zeros_like(hyp_grid_3D) # [B, N, 3]
+            #             # transform from camera to world coordinates
+            #             # ic(hyp_grid_3D.shape,poses.shape)
+            #             grid_3D = cam2world(hyp_grid_3D.squeeze().unsqueeze(0), poses) # [B, N, 3], [B, 3, 4] -> [B, 3]
+            #             center_3D = cam2world(center_3D.squeeze().unsqueeze(0), poses) # [B, N, 3]
+            #             directions = grid_3D - center_3D # [B, N, 3]
+            #             viewdirs = directions / torch.linalg.norm(
+            #                 directions, dim=-1, keepdims=True
+            #             )
                         
-                        center_3D = torch.reshape(center_3D, (-1, 3))
-                        viewdirs = torch.reshape(viewdirs, (-1, 3))
-                        # ic(center_3D.requires_grad)
-                        # ic(viewdirs.requires_grad)
-                        # ic(hyp_pose_optimizer.param_groups[0]['lr'])
-                        rays=Rays(origins=center_3D, viewdirs=viewdirs)
-                        # ic(rays.origins.shape,rays.viewdirs.shape)
-                        # render
-                        hyp_rgb, hyp_acc, hyp_depth, hyp_n_rendering_samples = render_image_with_occgrid(
-                            radiance_field=models["radiance_field"],
-                            estimator=models["estimator"],
-                            rays=rays,
-                            # rendering options
-                            near_plane=near_plane,
-                            render_step_size=render_step_size,
-                            render_bkgd=render_bkgd,
-                            cone_angle=cone_angle,
-                            alpha_thre=alpha_thre,
-                        )
+            #             center_3D = torch.reshape(center_3D, (-1, 3))
+            #             viewdirs = torch.reshape(viewdirs, (-1, 3))
+            #             # ic(center_3D.requires_grad)
+            #             # ic(viewdirs.requires_grad)
+            #             # ic(hyp_pose_optimizer.param_groups[0]['lr'])
+            #             rays=Rays(origins=center_3D, viewdirs=viewdirs)
+            #             # ic(rays.origins.shape,rays.viewdirs.shape)
+            #             # render
+            #             hyp_rgb, hyp_acc, hyp_depth, hyp_n_rendering_samples = render_image_with_occgrid(
+            #                 radiance_field=models["radiance_field"],
+            #                 estimator=models["estimator"],
+            #                 rays=rays,
+            #                 # rendering options
+            #                 near_plane=near_plane,
+            #                 render_step_size=render_step_size,
+            #                 render_bkgd=render_bkgd,
+            #                 cone_angle=cone_angle,
+            #                 alpha_thre=alpha_thre,
+            #             )
                         
-                        # compute the loss and record the loss
-                        # ic(hyp_rgb.shape)
-                        # ic(hyp_pixels.shape)
-                        # ic(hyp_pixels.shape)
-                        # ic(train_dataset.hypothesis_cam_num)
-                        accumulated_loss=0.9*accumulated_loss+0.1*torch.mean(((hyp_rgb.view(-1,3)-hyp_pixels.view(-1,3))**2.).view(train_dataset.hypothesis_cam_num,-1),dim=-1).detach()
-                        F1 = F.smooth_l1_loss(hyp_rgb.view(-1,3),hyp_pixels.view(-1,3))
-                        scaled_train_loss = hyp_grad_scaler.scale(F1)
-                        scaled_train_loss.backward()
+            #             # compute the loss and record the loss
+            #             # ic(hyp_rgb.shape)
+            #             # ic(hyp_pixels.shape)
+            #             # ic(hyp_pixels.shape)
+            #             # ic(train_dataset.hypothesis_cam_num)
+            #             accumulated_loss=0.9*accumulated_loss+0.1*torch.mean(((hyp_rgb.view(-1,3)-hyp_pixels.view(-1,3))**2.).view(train_dataset.hypothesis_cam_num,-1),dim=-1).detach()
+            #             F1 = F.smooth_l1_loss(hyp_rgb.view(-1,3),hyp_pixels.view(-1,3))
+            #             scaled_train_loss = hyp_grad_scaler.scale(F1)
+            #             scaled_train_loss.backward()
                         
-                        # ic(pertubation_se3)
-                        # exit()
-                        if it==0:
-                            save_camera_poses(args,train_dataset,outlier_ids=[outlier_id],path="init",hyp_se3=pertubation_se3)
-                            exit()
-                        if (it+1)%soft_epoch==0:
-                            hyp_pose_optimizer.step()
-                            # ic(pertubation_se3)
-                            # old_lr=hyp_pose_optimizer.param_groups[0]['lr']
-                            # pertubation_se3=pertubation_se3+(old_lr*2)**0.5*torch.randn_like(pertubation_se3)
+            #             # ic(pertubation_se3)
+            #             # exit()
+            #             if it==0:
+            #                 save_camera_poses(args,train_dataset,outlier_ids=[outlier_id],path="init",hyp_se3=pertubation_se3)
+            #                 exit()
+            #             if (it+1)%soft_epoch==0:
+            #                 hyp_pose_optimizer.step()
+            #                 # ic(pertubation_se3)
+            #                 # old_lr=hyp_pose_optimizer.param_groups[0]['lr']
+            #                 # pertubation_se3=pertubation_se3+(old_lr*2)**0.5*torch.randn_like(pertubation_se3)
                         
-                        if it%128==0:
-                            save_camera_poses(args,train_dataset,outlier_ids=[outlier_id],path="temp",hyp_se3=pertubation_se3)
-                    # remain the 25% best pose
-                    if epoch<Stage_number-1:
-                        with torch.no_grad():
+            #             if it%128==0:
+            #                 save_camera_poses(args,train_dataset,outlier_ids=[outlier_id],path="temp",hyp_se3=pertubation_se3)
+            #         # remain the 25% best pose
+            #         if epoch<Stage_number-1:
+            #             with torch.no_grad():
                             
                             
                             
-                            remain_pose_num=max(int((filter_ratio**(epoch+1))*train_dataset.hypothesis_cam_num),1)
-                            # ic(remain_pose_num)
-                            accumulated_loss,indices=torch.topk(accumulated_loss,remain_pose_num,largest=False)
-                            new_pertubation_se3=pertubation_se3[indices].detach().clone()
-                            # ic(new_pertubation_se3.shape)
-                            # resample arount the pose
-                            num_resmple_hypothesis=(num_hypothesis-remain_pose_num)//remain_pose_num
-                            # ic(num_resmple_hypothesis)
-                            # ic()
-                            translation_range/=2
-                            rotation_range/=2
+            #                 remain_pose_num=max(int((filter_ratio**(epoch+1))*train_dataset.hypothesis_cam_num),1)
+            #                 # ic(remain_pose_num)
+            #                 accumulated_loss,indices=torch.topk(accumulated_loss,remain_pose_num,largest=False)
+            #                 new_pertubation_se3=pertubation_se3[indices].detach().clone()
+            #                 # ic(new_pertubation_se3.shape)
+            #                 # resample arount the pose
+            #                 num_resmple_hypothesis=(num_hypothesis-remain_pose_num)//remain_pose_num
+            #                 # ic(num_resmple_hypothesis)
+            #                 # ic()
+            #                 translation_range/=2
+            #                 rotation_range/=2
                             
                             
-                            delta_translation=translation_range*(torch.rand(remain_pose_num,num_resmple_hypothesis,3).to('cuda')-0.5) # N , K , 3
-                            delta_rotation=torch.deg2rad(rotation_range*(torch.rand(remain_pose_num,num_resmple_hypothesis,3).to('cuda')-0.5))  # N , K , 3
-                            noise_term=torch.cat([delta_rotation,delta_translation],dim=-1) # N , K , 6
+            #                 delta_translation=translation_range*(torch.rand(remain_pose_num,num_resmple_hypothesis,3).to('cuda')-0.5) # N , K , 3
+            #                 delta_rotation=torch.deg2rad(rotation_range*(torch.rand(remain_pose_num,num_resmple_hypothesis,3).to('cuda')-0.5))  # N , K , 3
+            #                 noise_term=torch.cat([delta_rotation,delta_translation],dim=-1) # N , K , 6
                              
-                            # ic(noise_term)
-                            # ic(new_pertubation_se3.shape,noise_term.shape)
+            #                 # ic(noise_term)
+            #                 # ic(new_pertubation_se3.shape,noise_term.shape)
                             
-                            new_pose=(new_pertubation_se3.view(remain_pose_num,1,6)+noise_term).view(-1,6)
+            #                 new_pose=(new_pertubation_se3.view(remain_pose_num,1,6)+noise_term).view(-1,6)
                             
-                            # ic(pertubation_se3.shape)
-                            # ic(new_pertubation_se3.shape,new_pose.shape)
-                            new_pertubation_se3=torch.cat([new_pertubation_se3,new_pose],dim=0).view(-1,6)
-                            # ic(new_pertubation_se3.shape)
-                        # new_pertubation_se3.requires_grad=True
-                        # ic(new_pertubation_se3.shape)
-                        pertubation_se3=torch.nn.Parameter(new_pertubation_se3).view(-1,6)
-                        pertubation_se3=pertubation_se3.detach().clone().requires_grad_(True)
-                        # ic(pertubation_se3.shape)
-                        # ic(pertubation_se3.requires_grad)
-                        # ic(pertubation_se3.is_leaf)
-                        # reset the accumulated loss
-                        accumulated_loss=torch.zeros(train_dataset.hypothesis_cam_num).to('cuda')
-                        # reset the pose optimizer
-                        old_lr=hyp_pose_optimizer.param_groups[0]['lr']
-                        hyp_lr*=0.33
-                        hyp_pose_optimizer = torch.optim.SGD([pertubation_se3], lr=1.e-3,momentum=0.9)
-                        # ic(pertubation_se3.requires_grad)
-                        hyp_grad_scaler = torch.cuda.amp.GradScaler(2**10)
-                        # hyp_lr=hyp_lr*0.33
-                        # hyp_pose_optimizer = torch.optim.Adam([pertubation_se3], lr=hyp_lr)
-                        # hyp_pose_scheduler = torch.optim.lr_scheduler.ExponentialLR(
-                        #     hyp_pose_optimizer,
-                        #     gamma=(hyp_lr_end/hyp_lr)**(1/stage_iter)
-                        # )
+            #                 # ic(pertubation_se3.shape)
+            #                 # ic(new_pertubation_se3.shape,new_pose.shape)
+            #                 new_pertubation_se3=torch.cat([new_pertubation_se3,new_pose],dim=0).view(-1,6)
+            #                 # ic(new_pertubation_se3.shape)
+            #             # new_pertubation_se3.requires_grad=True
+            #             # ic(new_pertubation_se3.shape)
+            #             pertubation_se3=torch.nn.Parameter(new_pertubation_se3).view(-1,6)
+            #             pertubation_se3=pertubation_se3.detach().clone().requires_grad_(True)
+            #             # ic(pertubation_se3.shape)
+            #             # ic(pertubation_se3.requires_grad)
+            #             # ic(pertubation_se3.is_leaf)
+            #             # reset the accumulated loss
+            #             accumulated_loss=torch.zeros(train_dataset.hypothesis_cam_num).to('cuda')
+            #             # reset the pose optimizer
+            #             old_lr=hyp_pose_optimizer.param_groups[0]['lr']
+            #             hyp_lr*=0.33
+            #             hyp_pose_optimizer = torch.optim.SGD([pertubation_se3], lr=1.e-3,momentum=0.9)
+            #             # ic(pertubation_se3.requires_grad)
+            #             hyp_grad_scaler = torch.cuda.amp.GradScaler(2**10)
+            #             # hyp_lr=hyp_lr*0.33
+            #             # hyp_pose_optimizer = torch.optim.Adam([pertubation_se3], lr=hyp_lr)
+            #             # hyp_pose_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+            #             #     hyp_pose_optimizer,
+            #             #     gamma=(hyp_lr_end/hyp_lr)**(1/stage_iter)
+            #             # )
                         
                         
                     
-                # filter the pose
-                ic(old_re_localize_error,accumulated_loss.min().item())
-                if(old_re_localize_error>=accumulated_loss.min().item()):
-                    ic("prepare to update the camera pose")
-                    with torch.no_grad():
-                        ic(pertubation_se3[accumulated_loss.argmin().item()])
-                        ic("before pose ",models["radiance_field"].se3_refine.weight[outlier_pose_id].data)
-                        models["radiance_field"].se3_refine.weight[outlier_pose_id].data.copy_(pertubation_se3[accumulated_loss.argmin().item()].detach())
-                        ic("After pose ",models["radiance_field"].se3_refine.weight[outlier_pose_id].data)
+            #     # filter the pose
+            #     ic(old_re_localize_error,accumulated_loss.min().item())
+            #     if(old_re_localize_error>=accumulated_loss.min().item()):
+            #         ic("prepare to update the camera pose")
+            #         with torch.no_grad():
+            #             ic(pertubation_se3[accumulated_loss.argmin().item()])
+            #             ic("before pose ",models["radiance_field"].se3_refine.weight[outlier_pose_id].data)
+            #             models["radiance_field"].se3_refine.weight[outlier_pose_id].data.copy_(pertubation_se3[accumulated_loss.argmin().item()].detach())
+            #             ic("After pose ",models["radiance_field"].se3_refine.weight[outlier_pose_id].data)
                     
                     
                 
-                # visualize the hypothsis test pose
-                save_camera_poses(args,train_dataset,outlier_ids=[outlier_id],path="poses_outlier_after")
-                for key in optimizers:
-                    # setting gradient to None to avoid extra computations.
-                    optimizers[key].zero_grad(set_to_none=True)
-                    hyp_pose_optimizer.zero_grad(set_to_none=True)    
-                models["radiance_field"].zero_grad()
-                models["estimator"].zero_grad()
-                train_dataset.hypothesis_test=False
+            #     # visualize the hypothsis test pose
+            #     save_camera_poses(args,train_dataset,outlier_ids=[outlier_id],path="poses_outlier_after")
+            #     for key in optimizers:
+            #         # setting gradient to None to avoid extra computations.
+            #         optimizers[key].zero_grad(set_to_none=True)
+            #         hyp_pose_optimizer.zero_grad(set_to_none=True)    
+            #     models["radiance_field"].zero_grad()
+            #     models["estimator"].zero_grad()
+            #     train_dataset.hypothesis_test=False
                 # models["radiance_field"].train()
             
             #     train_dataset.hypothesis_test=False
@@ -729,8 +715,6 @@ if __name__ == "__main__":
                         "rgb&&depth": [wandb.Image(rgb_map_cpu),wandb.Image(depth_map_cpu)]
                     },step=step)
                 
-                # if step==6000:
-                #     exit()
         save_ckpt(save_dir=args.save_dir, iteration=step, models=models, optimizers=optimizers, schedulers=schedulers, final=True)
     else:
         step = iteration
@@ -742,7 +726,9 @@ if __name__ == "__main__":
 
     with torch.no_grad():
         print("Plotting final pose alignment.")
-        pose_refine = se3_to_SE3(models["radiance_field"].se3_refine.weight)
+        # pose_refine = se3_to_SE3(models["radiance_field"].se3_refine.weight)
+        
+        pose_refine = so3_t3_to_SE3(models["radiance_field"].se3_refine_R.weight, models["radiance_field"].se3_refine_T.weight)
         gt_poses = train_dataset.camfromworld
         pred_poses = compose_poses([pose_refine, models["radiance_field"].pose_noise, gt_poses])
         pose_aligned, sim3 = prealign_cameras(pred_poses, gt_poses)

@@ -10,7 +10,7 @@ from .ngp import NGPRadianceField
 
 sys.path.append("..")
 from camera_utils import cam2world
-from lie_utils import se3_to_SE3
+from lie_utils import se3_to_SE3,so3_t3_to_SE3
 from pose_utils import construct_pose, compose_poses
 from utils import Rays
 
@@ -60,8 +60,10 @@ class BAradianceField(torch.nn.Module):
         se3_noise = torch.randn(num_frame, dof, device=device) * 0.15
         self.pose_noise = se3_to_SE3(se3_noise)
         # Learnable embedding. 
-        self.se3_refine = torch.nn.Embedding(num_frame, dof, device=device)
-        torch.nn.init.zeros_(self.se3_refine.weight)
+        self.se3_refine_R = torch.nn.Embedding(num_frame, dof//2, device=device)
+        self.se3_refine_T = torch.nn.Embedding(num_frame, dof//2, device=device)
+        torch.nn.init.zeros_(self.se3_refine_R.weight)
+        torch.nn.init.zeros_(self.se3_refine_T.weight)
         # TODO:see if we want to register buffer for this variable.
         self.progress = torch.nn.Parameter(torch.tensor(0.))
         self.k = torch.arange(n_levels-1, dtype=torch.float32, device=device)
@@ -97,8 +99,10 @@ class BAradianceField(torch.nn.Module):
             init_poses = compose_poses([pose_noises, gt_poses])
             # add learnable pose correction
             assert idx is not None, "idx cannot be None during training."
-            se3_refine = self.se3_refine.weight[idx] # [B, 6] idx corresponds to frame number.
-            poses_refine = se3_to_SE3(se3_refine) # [1, 3, 4]
+            se3_refine_R = self.se3_refine_R.weight[idx] # [B, 3] idx corresponds to frame number.
+            se3_refine_T = self.se3_refine_T.weight[idx] # [B, 3] idx corresponds to frame number.
+            # se3_refine= torch.cat([se3_refine_R, se3_refine_T], dim=-1) # [B, 3]
+            poses_refine = so3_t3_to_SE3(se3_refine_R,se3_refine_T) # [1, 3, 4]
             # add learnable pose correction
             poses = compose_poses([poses_refine, init_poses])
         elif mode in ['val', 'eval', 'test-optim']:
@@ -151,4 +155,7 @@ class BAradianceField(torch.nn.Module):
     def update_progress(self, progress):
         self.progress.data.fill_(progress)
         self.nerf.progress.data.fill_(progress)
+    def get_refine_se3(self):
+        se3_refine= torch.cat([self.se3_refine_R.weight, self.se3_refine_T.weight], dim=-1) # [B, 6]
+        return se3_refine
 

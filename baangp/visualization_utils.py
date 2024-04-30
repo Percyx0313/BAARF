@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 
-def plot_save_poses_blender(fig, pose, pose_ref=None, path=None, ep=None, cam_depth=0.5,outlier=None,other_pose=None):
+def plot_save_poses_blender(fig, pose, pose_ref=None, path=None,name=None, ep=None, cam_depth=0.5,outlier=None,other_pose=None):
     # get the camera meshes
     _, _, cam = get_camera_mesh(pose, depth=cam_depth)
     cam = cam.numpy()
@@ -69,8 +69,10 @@ def plot_save_poses_blender(fig, pose, pose_ref=None, path=None, ep=None, cam_de
         for i in range(len(other_cam)):
             ax.plot(other_cam[i,:,0], other_cam[i,:,1], other_cam[i,:,2], color=outlier_color, linewidth=2)
             ax.scatter(other_cam[i,5,0], other_cam[i,5,1], other_cam[i,5,2], color=outlier_color, s=20)
-      
-    png_fname = "{}/{}.png".format(path,ep)
+    if name!=None:
+        png_fname = "{}/{}_{}.png".format(path,name,ep)
+    else:   
+        png_fname = "{}/{}.png".format(path,ep)
     plt.savefig(png_fname,dpi=75)
     # clean up
     plt.clf()
