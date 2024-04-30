@@ -9,7 +9,7 @@ from easydict import EasyDict as edict
 import numpy as np
 from pose_utils import invert_pose, to_hom, construct_pose, compose_poses
 import torch
-
+from icecream import ic
 
 # basic operations of transforming 3D points between world/camera/image coordinates
 def cam2world(X, pose):
@@ -125,3 +125,21 @@ def angle_to_rotation_matrix(a,axis):
                      torch.stack([O,O,I],dim=-1)],dim=-2)
     M = M.roll((roll,roll),dims=(-2,-1))
     return M
+
+
+def cam2world_split(X, pose):
+    """
+    Args:
+        X: 3D points in camera space with [H*W, 3]
+        pose: camera pose. camera_from_world, or world_to_camera [3, 3]
+    Returns:
+        transformation in world coordinate system.
+    """
+    # X of shape 64x3
+    # X_hom is of shape 64x4
+    X_hom = to_hom(X)
+    # pose_inv is world_from_camera pose is of shape 3x4
+    pose_inv = invert_pose(pose)
+    # world = camera * world_from_camera
+    ic(X_hom.shape, pose_inv.shape)
+    return X_hom@pose_inv.transpose(-1,-2)
