@@ -147,21 +147,23 @@ def validate(models , train_dataset, test_dataset):
                                                 ep=step)
     
         # evaluate novel view synthesis
-        test_dir = os.path.join(args.save_dir, "test_pred_view")
-        os.makedirs(test_dir,exist_ok=True)
-        for i in tqdm.tqdm([27]):
-            data = test_dataset[i]
-            gt_poses, pose_refine_test = evaluate_test_time_photometric_optim(
-                radiance_field=models["radiance_field"], estimator=models["estimator"],
-                render_step_size=render_step_size,
-                cone_angle=cone_angle,
-                data=data, 
-                sim3=sim3, lr_pose=optim_lr_pose, test_iter=100,
-                alpha_thre=alpha_thre,
-                device=device,
-                near_plane=near_plane,
-                far_plane=far_plane,
-                )
+    test_dir = os.path.join(args.save_dir, "test_pred_view")
+    os.makedirs(test_dir,exist_ok=True)
+    for i in tqdm.tqdm([27]):
+        data = test_dataset[i]
+        gt_poses, pose_refine_test = evaluate_test_time_photometric_optim(
+            radiance_field=models["radiance_field"], estimator=models["estimator"],
+            render_step_size=render_step_size,
+            cone_angle=cone_angle,
+            data=data, 
+            sim3=sim3, lr_pose=optim_lr_pose, test_iter=100,
+            alpha_thre=alpha_thre,
+            device=device,
+            near_plane=near_plane,
+            far_plane=far_plane,
+            )
+        
+        with torch.no_grad():
             rays = models["radiance_field"].query_rays(idx=None,
                                                     sim3=sim3, 
                                                     gt_poses=gt_poses, 
