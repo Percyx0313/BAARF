@@ -68,6 +68,8 @@ def plot_save_poses_blender(fig, pose, pose_ref=None, path=None,name=None, ep=No
     if other_pose is not None:
         for i in range(len(other_cam)):
             ax.plot(other_cam[i,:,0], other_cam[i,:,1], other_cam[i,:,2], color=outlier_color, linewidth=2)
+            
+            ax.plot(other_cam[i,:2,0], other_cam[i,:2,1], other_cam[i,:2,2], color=(0,0,1.0), linewidth=2)
             ax.scatter(other_cam[i,5,0], other_cam[i,5,1], other_cam[i,5,2], color=outlier_color, s=20)
     if name!=None:
         png_fname = "{}/{}_{}.png".format(path,name,ep)

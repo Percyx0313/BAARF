@@ -7,10 +7,11 @@ Reference: https://github.com/chenhsuanlin/bundle-adjusting-NeRF
 
 from easydict import EasyDict as edict
 import numpy as np
-from pose_utils import invert_pose, to_hom, construct_pose, compose_poses
+from pose_utils import invert_pose, to_hom, construct_pose, compose_poses,compose_split
 import torch
 from icecream import ic
-
+from lie_utils import so3_t3_to_SE3,SO3_to_so3,so3_to_SO3
+from icecream import ic
 # basic operations of transforming 3D points between world/camera/image coordinates
 def cam2world(X, pose):
     """
@@ -143,3 +144,33 @@ def cam2world_split(X, pose):
     # world = camera * world_from_camera
     ic(X_hom.shape, pose_inv.shape)
     return X_hom@pose_inv.transpose(-1,-2)
+@torch.no_grad()
+def generate_uniform_hypothesis(range_T,range_R,
+                               outlier_se3_T,outlier_se3_R,
+                               pose_noise,pose_gt,num_hypothesis):
+    
+    '''
+    c2w  = (pose_gt@pose_noise@pose_refine)^-1
+    pose_init=pose_gt @pose_noise
+    # find pose_hyp 
+    R@c2w+T = (pose_gt@pose_noise@pose_hyp)^-1
+    => pose_gt@pose_noise@pose_hyp = (R@c2w+T)^-1
+    => pose_hyp = (pose_gt@pose_noise)^-1@(R@c2w+T)^-1
+    => pose_hyp = ((R@c2w+T) @ pose_gt @pose_noise)^-1
+    '''
+    delta_T=range_T*(torch.rand(num_hypothesis,3).to('cuda')-0.5)
+    delta_R=torch.deg2rad(range_R*(torch.rand(num_hypothesis,3).to('cuda')-0.5))
+    uniform_RT=so3_t3_to_SE3(delta_R,delta_T)
+    
+    poses_refine = so3_t3_to_SE3(outlier_se3_R,outlier_se3_T) # [1, 3, 4]
+    c2w = invert_pose(compose_poses([poses_refine, pose_noise, pose_gt]))
+    pose_init=compose_poses([pose_noise,pose_gt])
+    Rc2w_T=compose_split(c2w,uniform_RT)
+    
+    pose_hyp=invert_pose(compose_poses([pose_init,Rc2w_T]))
+    hyp_R,hyp_T=pose_hyp.split([3,1],dim=-1)
+    
+    
+    hyp_R=SO3_to_so3(hyp_R)
+    
+    return  hyp_R.view(-1,3),hyp_T.view(-1,3)

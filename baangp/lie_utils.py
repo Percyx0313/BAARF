@@ -7,7 +7,7 @@ Reference: https://github.com/chenhsuanlin/bundle-adjusting-NeRF
 
 
 import torch
-
+import numpy as np
 
 def so3_to_SO3(w): # [...,3]
     wx = skew_symmetric(w)
