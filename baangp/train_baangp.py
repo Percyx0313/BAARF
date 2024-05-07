@@ -13,13 +13,13 @@ import torch.nn.functional as F
 from torchmetrics import StructuralSimilarityIndexMeasure, MultiScaleStructuralSimilarityIndexMeasure
 import torchvision.transforms.functional as torchvision_F
 import tqdm
-from datasets.ba_synthetic import SubjectLoader
 from evaluation_utils import (
     evaluate_camera_alignment,
     evaluate_test_time_photometric_optim,
     prealign_cameras,
     pose_evaluate
 )
+import importlib
 from lie_utils import se3_to_SE3,so3_t3_to_SE3
 from nerfacc.estimators.occ_grid import OccGridEstimator
 from pose_utils import compose_poses,compose_split,invert_pose
@@ -184,6 +184,12 @@ def validate(models , train_dataset, test_dataset):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        "--dataset",
+        type=str,
+        required=True,
+        help="the root dir of the dataset",
+    )
+    parser.add_argument(
         "--data-root",
         type=str,
         help="the root dir of the dataset",
@@ -199,7 +205,6 @@ if __name__ == "__main__":
         "--scene",
         type=str,
         default="lego",
-        choices=SubjectLoader.SUBJECT_IDS,
         help="which scene to use",
     )
 
@@ -212,7 +217,6 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--c2f",
-        type=float,
         nargs="+",
         action="extend"
     )
@@ -254,12 +258,24 @@ if __name__ == "__main__":
         action="store_true",
     )
     
+    parser.add_argument(
+        "--reloc",
+        action="store_true",
+    )
+    
 
     parser.add_argument("--save-dir", type=str,
         required=True,
         help="The output root directory for saving models.")
-    args = parser.parse_args()
 
+
+
+
+
+
+
+    args = parser.parse_args()
+    args.c2f=[0.1,0.5]
     device = "cuda:0"
     
     set_random_seed(args.seed)
@@ -276,16 +292,13 @@ if __name__ == "__main__":
     lr_pose_T = 5.e-3 #1.e-2
     optim_lr_pose = 1.e-3
     max_steps = 40000 # 20000
-    init_batch_size = 1024
+    init_batch_size = 32
     target_sample_batch_size = 1 << 18
     weight_decay = 1e-6
     # scene parameters
     aabb = torch.tensor([-1.5, -1.5, -1.5, 1.5, 1.5, 1.5], device=device)
     near_plane = 0.0
     far_plane = 1.0e10
-    # dataset parameters
-    train_dataset_kwargs = {"factor": 2}
-    test_dataset_kwargs = {"factor": 2}
     # model parameters
     grid_resolution = 128
     grid_nlvl = 1
@@ -315,7 +328,21 @@ if __name__ == "__main__":
     
     
     
-    train_dataset = SubjectLoader(
+    if args.dataset=="blender":
+        dataset="ba_synthetic"
+        # dataset parameters
+        train_dataset_kwargs = {"factor": 2}
+        test_dataset_kwargs = {"factor": 2}
+    elif args.dataset=="llff":
+        dataset="ba_real"
+        train_dataset_kwargs = {"factor": 8}
+        test_dataset_kwargs = {"factor": 8}
+    else:
+        assert False ,"Give the dataset!"
+        
+    dataset_module=importlib.import_module("datasets.{}".format(dataset))
+    
+    train_dataset = dataset_module.SubjectLoader(
         subject_id=args.scene,
         root_fp=args.data_root,
         split=args.train_split,
@@ -333,7 +360,7 @@ if __name__ == "__main__":
     print("Found %d train images"%len(train_dataset.images))
     print("Train image shape", train_dataset.images.shape)
     print("Setup the test dataset.")
-    test_dataset = SubjectLoader(
+    test_dataset = dataset_module.SubjectLoader(
         subject_id=args.scene,
         root_fp=args.data_root,
         split="test",
@@ -390,7 +417,7 @@ if __name__ == "__main__":
 
     models, optimizers, schedulers, epoch, iteration, has_checkpoint = load_ckpt(save_dir=args.save_dir, models=models, optimizers=optimizers, schedulers=schedulers)
     # training
-    current_pyramid_level=3
+    current_pyramid_level=1
     train_dataset.change_pyramid_img(level=current_pyramid_level)
     print(f"Update pyramid level to {current_pyramid_level}")
     
@@ -400,12 +427,12 @@ if __name__ == "__main__":
         for step in loader:
             models['radiance_field'].train()
             models["estimator"].train()
-
             
-            if (step//2500)>(3-current_pyramid_level) and current_pyramid_level>0:
-                current_pyramid_level-=1
-                train_dataset.change_pyramid_img(level=current_pyramid_level)
-                print(f"Update pyramid level to {current_pyramid_level}")
+            
+            # if (step//2500)>(3-current_pyramid_level) and current_pyramid_level>0:
+            #     current_pyramid_level-=1
+            #     train_dataset.change_pyramid_img(level=current_pyramid_level)
+            #     print(f"Update pyramid level to {current_pyramid_level}")
             train_dataset.progress = min(train_dataset.progress+1/2500,1)
             
             
@@ -466,9 +493,9 @@ if __name__ == "__main__":
 
             
             loss = F.smooth_l1_loss(rgb, pixels)#+0.001*feat_reg#+consistency_loss
-            with torch.no_grad():
-                re_localize_error_list*=0.9
-                re_localize_error_list.index_add_(0,image_ids,0.1*torch.mean((rgb.view(-1,3)-pixels.view(-1,3))**2.,dim=-1))
+            # with torch.no_grad():
+            #     re_localize_error_list*=0.9
+            #     re_localize_error_list.index_add_(0,image_ids,0.1*torch.mean((rgb.view(-1,3)-pixels.view(-1,3))**2.,dim=-1))
             old_pose_R=models["radiance_field"].se3_refine_R.weight.clone()
             old_pose_T=models["radiance_field"].se3_refine_T.weight.clone()
                 
@@ -495,17 +522,17 @@ if __name__ == "__main__":
                 models["radiance_field"].se3_refine_R.weight.data=((1-ema_alpha)*models["radiance_field"].se3_refine_R.weight+ema_alpha*old_pose_R)
                 models["radiance_field"].se3_refine_T.weight.data=((1-ema_alpha)*models["radiance_field"].se3_refine_T.weight+ema_alpha*old_pose_T)
             
-            if(step%1000==0 and step >5000):
+            if(args.reloc==True and step%1000==0 and step >5000):
                 ic(models["radiance_field"].se3_refine_R.weight[outlier_id])
             
-            if((step+2500)%5000==0 and step!=0):
+            if(args.reloc==True and (step+2500)%5000==0 and step!=0 and step <max_steps-5000):
                 # fine and stop traing the outlier pose
                 ic("the max error camera is : ",re_localize_error_list.argmax().item() , re_localize_error_list.max().item())
                 old_re_localize_error=re_localize_error_list.max().item()
                 outlier_id= re_localize_error_list.argmax().item()
                 train_dataset.outlier_idx=outlier_id
             
-            if((step+1)%5000==0 and step!=0):
+            if(args.reloc==True and (step+1)%5000==0 and step!=0 and  step <max_steps-5000 ):
                 train_dataset.outlier_idx=None
                 train_dataset.hypothesis_test=True
                 # show the outlier before relocalization
@@ -690,12 +717,12 @@ if __name__ == "__main__":
                     
                     
                     # show the pose and render image with depth and rgb
-                    rot_error,trans_error,rgb_map_cpu,depth_map_cpu=validate(models , train_dataset, test_dataset)
-                    wandb.log({
-                        "rot_error": rot_error,
-                        "trans_error": trans_error,
-                        "rgb&&depth": [wandb.Image(rgb_map_cpu),wandb.Image(depth_map_cpu)]
-                    },step=step)
+                    # rot_error,trans_error,rgb_map_cpu,depth_map_cpu=validate(models , train_dataset, test_dataset)
+                    # wandb.log({
+                    #     "rot_error": rot_error,
+                    #     "trans_error": trans_error,
+                    #     "rgb&&depth": [wandb.Image(rgb_map_cpu),wandb.Image(depth_map_cpu)]
+                    # },step=step)
                 
         save_ckpt(save_dir=args.save_dir, iteration=step, models=models, optimizers=optimizers, schedulers=schedulers, final=True)
     else:

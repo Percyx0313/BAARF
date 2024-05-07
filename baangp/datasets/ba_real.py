@@ -202,6 +202,8 @@ class SubjectLoader(torch.utils.data.Dataset):
         "teapot",
         "toaster",
         "fern",
+        "flower",
+        "fern",
         "horns"
     ]
 
