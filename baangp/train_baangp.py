@@ -34,10 +34,12 @@ import visualization_utils as viz
 from einops import rearrange
 
 import wandb
-from icecream import ic
+from icecream import ic, install
+install()
 from camera_utils import cam2world, rotation_distance, procrustes_analysis
 from pose_utils import construct_pose
 from utils import Rays
+from s3im import S3IM
 def save_camera_poses(args,train_dataset,outlier_ids : list =None,path="poses_outlier",name=None,pertubation_SE3=None):
     models["radiance_field"].eval()
     models["estimator"].eval()
@@ -49,6 +51,7 @@ def save_camera_poses(args,train_dataset,outlier_ids : list =None,path="poses_ou
                       models["radiance_field"].se3_refine_T.weight,
                       models["radiance_field"].pose_noise,
                       gt_poses)
+        
         
         print("--------------------------")
         print("{} train rot error:   {:8.3f}".format(step, rot_error)) # to use numpy, the value needs to be on cpu first.
@@ -93,7 +96,7 @@ def save_camera_poses(args,train_dataset,outlier_ids : list =None,path="poses_ou
     models['radiance_field'].testing = False
     
 
-def validate(models , train_dataset, test_dataset):
+def validate(models , train_dataset, test_dataset,step=0):
     models["radiance_field"].eval()
     models["estimator"].eval()
     models['radiance_field'].testing = True
@@ -104,8 +107,10 @@ def validate(models , train_dataset, test_dataset):
         pose_evaluate(models["radiance_field"].se3_refine_R.weight, 
                       models["radiance_field"].se3_refine_T.weight,
                       models["radiance_field"].pose_noise,
-                      gt_poses)
+                      gt_poses,
+                      dataset='llff')
         
+        ic(sim3.t0, sim3.t1, sim3.s0, sim3.s1, sim3.R)
         print("--------------------------")
         print("{} train rot error:   {:8.3f}".format(step, rot_error)) # to use numpy, the value needs to be on cpu first.
         print("{} train trans error: {:10.5f}".format(step, trans_error))
@@ -116,16 +121,17 @@ def validate(models , train_dataset, test_dataset):
         fig = plt.figure(figsize=(10, 10))
         cam_dir = os.path.join(args.save_dir, "poses")
         os.makedirs(cam_dir, exist_ok=True)
-        png_fname = viz.plot_save_poses_blender(fig=fig,
-                                                pose=pose_aligned_detached, 
-                                                pose_ref=gt_poses_detached, 
-                                                path=cam_dir, 
-                                                ep=step)
+        viz.plot_save_poses_llff(fig,pose_aligned_detached,pose_ref=gt_poses_detached,path=cam_dir,ep=step)
+        # png_fname = viz.plot_save_poses_blender(fig=fig,
+        #                                         pose=pose_aligned_detached, 
+        #                                         pose_ref=gt_poses_detached, 
+        #                                         path=cam_dir, 
+        #                                         ep=step)
     
         # evaluate novel view synthesis
-    test_dir = os.path.join(args.save_dir, "test_pred_view")
-    os.makedirs(test_dir,exist_ok=True)
-    for i in tqdm.tqdm([27]):
+        test_dir = os.path.join(args.save_dir, "test_pred_view")
+        os.makedirs(test_dir,exist_ok=True)
+    for i in tqdm.tqdm([0]):
         data = test_dataset[i]
         gt_poses, pose_refine_test = evaluate_test_time_photometric_optim(
             radiance_field=models["radiance_field"], estimator=models["estimator"],
@@ -148,7 +154,7 @@ def validate(models , train_dataset, test_dataset):
                                                     test_photo=True,
                                                     grid_3D=data['grid_3D'])
             # rendering
-            rgb, opacity, depth, _ = render_image_with_occgrid(
+            rgb, opacity, depth, _,_ = render_image_with_occgrid(
                 # scene
                 radiance_field=models["radiance_field"],
                 estimator=models["estimator"],
@@ -173,13 +179,13 @@ def validate(models , train_dataset, test_dataset):
             depth_map_cpu = invdepth_map.cpu()
             rgb_map_cpu=torchvision_F.to_pil_image(rgb_map_cpu)#.save("{}/rgb_{}.png".format(test_dir,i))
             depth_map_cpu=torchvision_F.to_pil_image(depth_map_cpu)#.save("{}/depth_{}.png".format(test_dir,i))
-            rgb_map_cpu.save("{}/rgb_{}.png".format(test_dir,i))
-            depth_map_cpu.save("{}/depth_{}.png".format(test_dir,i))
+            rgb_map_cpu.save("{}/rgb_{}.png".format(test_dir,step))
+            depth_map_cpu.save("{}/depth_{}.png".format(test_dir,step))
             
     models["radiance_field"].train()
     models["estimator"].train()
     models['radiance_field'].testing = False
-    return rot_error,trans_error,rgb_map_cpu,depth_map_cpu
+    # return rot_error,trans_error,rgb_map_cpu,depth_map_cpu
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -286,24 +292,21 @@ if __name__ == "__main__":
         os.makedirs(args.save_dir, exist_ok=True)
 
     # training parameters
-    lr = 1.e-2
-    lr_end = 1.e-4
-    lr_pose_R = 3.e-3 #1.e-2
-    lr_pose_T = 5.e-3 #1.e-2
+    lr = 1.e-2  if args.dataset=='blender' else  1.e-2
+    lr_end = 1.e-4 if args.dataset=='blender' else 1.e-4
+    lr_pose_R = 3.e-3 if args.dataset=='blender' else  5.e-2#1.e-2
+    lr_pose_T = 5.e-3 if args.dataset=='blender' else  3.e-2#1.e-2
     optim_lr_pose = 1.e-3
-    max_steps = 40000 # 20000
-    init_batch_size = 32
+    max_steps = 40000 if args.dataset=='blender' else 20000
+    init_batch_size = 1024
     target_sample_batch_size = 1 << 18
     weight_decay = 1e-6
-    # scene parameters
-    aabb = torch.tensor([-1.5, -1.5, -1.5, 1.5, 1.5, 1.5], device=device)
-    near_plane = 0.0
-    far_plane = 1.0e10
+    
+          
     # model parameters
     grid_resolution = 128
     grid_nlvl = 1
     # render parameters
-    render_step_size = 5e-3
     alpha_thre = 0.0
     cone_angle = 0.0
 
@@ -335,11 +338,15 @@ if __name__ == "__main__":
         test_dataset_kwargs = {"factor": 2}
     elif args.dataset=="llff":
         dataset="ba_real"
-        train_dataset_kwargs = {"factor": 8}
-        test_dataset_kwargs = {"factor": 8}
+        train_dataset_kwargs = {"factor": 1}
+        test_dataset_kwargs = {"factor": 1}
     else:
         assert False ,"Give the dataset!"
-        
+    
+    
+    
+    
+    
     dataset_module=importlib.import_module("datasets.{}".format(dataset))
     
     train_dataset = dataset_module.SubjectLoader(
@@ -351,12 +358,28 @@ if __name__ == "__main__":
         device=device,
         **train_dataset_kwargs,
     )
+    # scene parameters
+    if args.dataset=='llff':
+        aabb_scale=2**np.ceil(np.log2(train_dataset.max_bound))
+        aabb = torch.tensor([-aabb_scale, -aabb_scale, -aabb_scale, aabb_scale, aabb_scale, aabb_scale], device=device)
+        near_plane = 0
+        ic(aabb_scale)
+        far_plane = aabb_scale*np.sqrt(3)
+    elif args.dataset=='blender':
+        aabb = torch.tensor([-1.5, -1.5, -1.5, 1.5, 1.5, 1.5], device=device)
+        near_plane = 0.0
+        far_plane = 1.0e10
+    else:
+        assert False,"Need to give the known dataset"
     
+    render_step_size = 5e-3 if args.dataset=='blender' else 1e-2
+    target_render_step_size = 5e-3 if args.dataset=='blender' else 5e-3
     
     # re-localization 
     re_localize_error_list=torch.zeros(len(train_dataset),device=device)
     
-    
+    # s3im loss
+    s3im=S3IM()
     print("Found %d train images"%len(train_dataset.images))
     print("Train image shape", train_dataset.images.shape)
     print("Setup the test dataset.")
@@ -386,11 +409,19 @@ if __name__ == "__main__":
         aabb=estimator.aabbs[-1],
         device=device,
         c2f=args.c2f,
+        dataset=args.dataset,
+        geo_feat_dim=32
         ).to(device)
     
     print("Setting up optimizers...")
+    # setting optimizer w/o se3_refine_R.weight and se3_refine_T.weight
+    parameters = []
+    for name, param in radiance_field.named_parameters():
+        if 'se3_refine_R' not in name and 'se3_refine_T' not in name:
+            parameters.append(param)
+    
     optimizer = torch.optim.Adam(
-        radiance_field.parameters(), lr=lr, eps=1e-15, weight_decay=weight_decay
+        parameters, lr=lr, eps=1e-15, weight_decay=weight_decay
     )
     scheduler = torch.optim.lr_scheduler.ExponentialLR(
                 optimizer,
@@ -405,7 +436,7 @@ if __name__ == "__main__":
          {'params':models['radiance_field'].se3_refine_T.parameters(), 'lr':lr_pose_T}],betas=[0.9,0.99])
     pose_scheduler = torch.optim.lr_scheduler.ExponentialLR(
         pose_optimizer,
-        gamma=(1.e-1)**(1./max_steps)
+        gamma=(1.e-2)**(1./max_steps)
     )
     schedulers["pose_scheduler"] = pose_scheduler
     optimizers["pose_optimizer"] = pose_optimizer
@@ -417,22 +448,26 @@ if __name__ == "__main__":
 
     models, optimizers, schedulers, epoch, iteration, has_checkpoint = load_ckpt(save_dir=args.save_dir, models=models, optimizers=optimizers, schedulers=schedulers)
     # training
-    current_pyramid_level=1
+    current_pyramid_level=3
     train_dataset.change_pyramid_img(level=current_pyramid_level)
     print(f"Update pyramid level to {current_pyramid_level}")
     
     if not has_checkpoint:
         tic = time.time()
         loader = tqdm.trange(max_steps + 1, desc="training", leave=False)
+        validate(models , train_dataset, test_dataset,step=0)
         for step in loader:
             models['radiance_field'].train()
             models["estimator"].train()
             
+            # linear increase the step size
+            # render_step_size = render_step_size + (target_render_step_size - render_step_size) * step / max_steps
             
-            # if (step//2500)>(3-current_pyramid_level) and current_pyramid_level>0:
-            #     current_pyramid_level-=1
-            #     train_dataset.change_pyramid_img(level=current_pyramid_level)
-            #     print(f"Update pyramid level to {current_pyramid_level}")
+            
+            if (step//2500)>(3-current_pyramid_level) and current_pyramid_level>0:
+                current_pyramid_level-=1
+                train_dataset.change_pyramid_img(level=current_pyramid_level)
+                print(f"Update pyramid level to {current_pyramid_level}")
             train_dataset.progress = min(train_dataset.progress+1/2500,1)
             
             
@@ -468,7 +503,7 @@ if __name__ == "__main__":
 
             rays = models["radiance_field"].query_rays(idx=image_ids, grid_3D=grid_3D, gt_poses=gt_poses, mode='train')
             # render
-            rgb, acc, depth, n_rendering_samples = render_image_with_occgrid(
+            rgb, acc, depth, n_rendering_samples,alphas_t = render_image_with_occgrid(
                 radiance_field=models["radiance_field"],
                 estimator=models["estimator"],
                 rays=rays,
@@ -492,13 +527,19 @@ if __name__ == "__main__":
                 train_dataset.update_num_rays(num_rays)
 
             
-            loss = F.smooth_l1_loss(rgb, pixels)#+0.001*feat_reg#+consistency_loss
+            loss = F.smooth_l1_loss(rgb, pixels)#-0.001*torch.mean(alphas_t*torch.log(alphas_t+1e-8)+(1-alphas_t)*torch.log((1-alphas_t)+1e-8))#+0.001*feat_reg#+consistency_loss
+            
+            # s3im loss
+            
+            size= np.floor((rgb.shape[0])**0.5).astype(int)
+            s3im_loss = s3im(rgb[:size**2], pixels[:size**2],size,size)
+            loss+=0.1*s3im_loss
+            
             # with torch.no_grad():
             #     re_localize_error_list*=0.9
             #     re_localize_error_list.index_add_(0,image_ids,0.1*torch.mean((rgb.view(-1,3)-pixels.view(-1,3))**2.,dim=-1))
             old_pose_R=models["radiance_field"].se3_refine_R.weight.clone()
             old_pose_T=models["radiance_field"].se3_refine_T.weight.clone()
-                
             
             
             
@@ -691,7 +732,6 @@ if __name__ == "__main__":
                     reloc_pose_optimizer.zero_grad(set_to_none=True)  
                 models["radiance_field"].zero_grad()
                 models["estimator"].zero_grad()            
-                # exit()
               
             
             if step % 200 == 0:
@@ -718,11 +758,15 @@ if __name__ == "__main__":
                     
                     # show the pose and render image with depth and rgb
                     # rot_error,trans_error,rgb_map_cpu,depth_map_cpu=validate(models , train_dataset, test_dataset)
+                    if step!=0:
+                        validate(models , train_dataset, test_dataset,step=step)
                     # wandb.log({
                     #     "rot_error": rot_error,
                     #     "trans_error": trans_error,
                     #     "rgb&&depth": [wandb.Image(rgb_map_cpu),wandb.Image(depth_map_cpu)]
                     # },step=step)
+            # if step%10==0 and step!=0:
+            #     validate(models , train_dataset, test_dataset,step=step)
                 
         save_ckpt(save_dir=args.save_dir, iteration=step, models=models, optimizers=optimizers, schedulers=schedulers, final=True)
     else:
@@ -739,7 +783,11 @@ if __name__ == "__main__":
         
         pose_refine = so3_t3_to_SE3(models["radiance_field"].se3_refine_R.weight, models["radiance_field"].se3_refine_T.weight)
         gt_poses = train_dataset.camfromworld
-        pred_poses = compose_poses([pose_refine, models["radiance_field"].pose_noise, gt_poses])
+        if args.dataset=='blender':
+            pred_poses = compose_poses([pose_refine, models["radiance_field"].pose_noise, gt_poses])
+        else:
+            
+            pred_poses= so3_t3_to_SE3(models["radiance_field"].se3_refine_R.weight, models["radiance_field"].se3_refine_T.weight)
         pose_aligned, sim3 = prealign_cameras(pred_poses, gt_poses)
         error = evaluate_camera_alignment(pose_aligned, gt_poses)
         rot_error = np.rad2deg(error.R.mean().item())
@@ -772,6 +820,7 @@ if __name__ == "__main__":
     res = []
     for i in tqdm.tqdm(range(len(test_dataset))):
         data = test_dataset[i]
+        ic(data["pixels"].shape)
         gt_poses, pose_refine_test = evaluate_test_time_photometric_optim(
             radiance_field=models["radiance_field"], estimator=models["estimator"],
             render_step_size=render_step_size,
@@ -792,7 +841,7 @@ if __name__ == "__main__":
                                                        test_photo=True,
                                                        grid_3D=data['grid_3D'])
             # rendering
-            rgb, opacity, depth, _ = render_image_with_occgrid(
+            rgb, opacity, depth, _,_ = render_image_with_occgrid(
                 # scene
                 radiance_field=models["radiance_field"],
                 estimator=models["estimator"],
@@ -805,13 +854,16 @@ if __name__ == "__main__":
                 cone_angle=cone_angle,
                 alpha_thre=alpha_thre,
             )
+            rgb=rgb.detach()
+            opacity=opacity.detach()
+            depth=depth.detach()
             # evaluate view synthesis
             invdepth = 1/ depth
             loaded_pixels = data["pixels"]
             h, w, c = loaded_pixels.shape
             pixels = loaded_pixels.permute(2, 0, 1)
-            rgb_map = rgb.view(h, w, 3).permute(2, 0, 1)
-            invdepth_map = invdepth.view(h, w)
+            rgb_map = rgb.view(h, w, 3).permute(2, 0, 1).detach()
+            invdepth_map = invdepth.view(h, w).detach()
             mse = F.mse_loss(rgb_map, pixels)
             psnr = (-10.0 * torch.log(mse) / np.log(10.0)).item()
             ssim_val = ssim(rgb_map[None, ...], pixels[None, ...]).item()
@@ -819,6 +871,7 @@ if __name__ == "__main__":
             lpips_loss_val = lpips_fn(rgb, loaded_pixels).item()
             res.append(edict(psnr=psnr, ssim=ssim_val, ms_ssim=ms_ssim_val, lpips=lpips_loss_val))
             # dump novel views
+            ic("asdsadsadsad")
             rgb_map_cpu = rgb_map.cpu()
             gt_map_cpu = pixels.cpu()
             depth_map_cpu = invdepth_map.cpu()
