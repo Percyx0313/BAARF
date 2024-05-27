@@ -46,7 +46,7 @@ def render_image_with_occgrid(
     cone_angle: float = 0.0,
     alpha_thre: float = 0.0,
     # test options
-    test_chunk_size: int = 8192,
+    test_chunk_size: int = 4096,
     timestamps: Optional[torch.Tensor] = None,
 ):
     """Render the pixels of an image."""
@@ -93,6 +93,10 @@ def render_image_with_occgrid(
         return rgbs, sigmas.squeeze(-1)
 
     results = []
+    alphas=[]
+    ts=[]
+    deltas=[]
+    ws=[]
     chunk = (
         torch.iinfo(torch.int32).max
         if radiance_field.training
@@ -119,17 +123,30 @@ def render_image_with_occgrid(
             rgb_sigma_fn=rgb_sigma_fn,
             render_bkgd=render_bkgd,
         )
+        alphas.append(extras['alphas'])
+        ts.append((t_starts+t_ends)/2.0)
+        deltas.append((t_ends-t_starts))
         chunk_results = [rgb, opacity, depth, len(t_starts)]
         results.append(chunk_results)
+        ws.append(extras['weights'])
     colors, opacities, depths, n_rendering_samples = [
         torch.cat(r, dim=0) if isinstance(r[0], torch.Tensor) else r
         for r in zip(*results)
     ]
+    
+    alphas_t=torch.cat(alphas,dim=0)
+    ts_t=torch.cat(ts,dim=0)
+    deltas_t=torch.cat(deltas,dim=0)
+    ws_t=torch.cat(ws,dim=0)
     return (
         colors.view((*rays_shape[:-1], -1)),
         opacities.view((*rays_shape[:-1], -1)),
         depths.view((*rays_shape[:-1], -1)),
         sum(n_rendering_samples),
+        alphas_t,
+        ts_t,
+        deltas_t,
+        ws_t
     )
 
 

@@ -11,12 +11,13 @@ import tqdm
 from utils import (
     render_image_with_occgrid,
 )
-from pose_utils import construct_pose
-from camera_utils import cam2world, rotation_distance, procrustes_analysis
-from lie_utils import se3_to_SE3
+from pose_utils import construct_pose,compose_poses
+from camera_utils import cam2world, rotation_distance, procrustes_analysis 
+from lie_utils import se3_to_SE3,so3_t3_to_SE3
 from easydict import EasyDict as edict
 from utils import Rays
-
+import numpy as np
+from icecream import ic
 
 def prealign_cameras(pred_poses, gt_poses):
     """
@@ -76,6 +77,7 @@ def evaluate_test_time_photometric_optim(
     # use another se3 Parameter to absorb the remaining pose errors
     se3_refine_test = torch.nn.Parameter(torch.zeros(6, device=device))
     pose_optimizer = torch.optim.Adam([se3_refine_test], lr=lr_pose) 
+    
     iterator = tqdm.trange(test_iter, desc="test-time optim.", leave=False,position=1)
     grid_3D = data["grid_3D"]
     pixels = data["pixels"]
@@ -101,7 +103,7 @@ def evaluate_test_time_photometric_optim(
         sampled_origins = origins[ray_idx]
         sampled_viewdirs = viewdirs[ray_idx]
         sampled_rays = Rays(origins=sampled_origins, viewdirs=sampled_viewdirs)
-        rgb, _, _, n_rendering_samples = render_image_with_occgrid(
+        rgb, _, _, n_rendering_samples,_ = render_image_with_occgrid(
             # scene
             radiance_field=radiance_field,
             estimator=estimator,
@@ -125,3 +127,18 @@ def evaluate_test_time_photometric_optim(
         iterator.set_postfix(loss="{:.3f}".format(loss))
     return gt_poses, pose_refine_test
 
+def pose_evaluate(se3_refine_R, se3_refine_T, pose_noise,gt_poses,dataset='blender'):
+    
+    pose_refine = so3_t3_to_SE3(se3_refine_R, se3_refine_T)
+    if dataset=='blender':
+        pred_poses = compose_poses([pose_refine,pose_noise, gt_poses])
+    else:
+        # pose_init = torch.eye(3,4).to(pose_refine.device).detach()
+        pred_poses = pose_refine
+        # print(pred_poses)
+        
+    pose_aligned, sim3 = prealign_cameras(pred_poses, gt_poses)
+    error = evaluate_camera_alignment(pose_aligned, gt_poses)
+    rot_error = np.rad2deg(error.R.mean().item())
+    trans_error = error.t.mean().item()
+    return rot_error,trans_error ,pose_aligned, sim3

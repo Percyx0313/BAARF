@@ -12,6 +12,7 @@ import os
 from PIL import Image
 import sys
 import torch
+import torch.nn.functional as torch_F
 
 sys.path.append("..")
 
@@ -20,16 +21,45 @@ from lie_utils import se3_to_SE3
 from pose_utils import to_hom, construct_pose, compose_poses, invert_pose
 import kornia
 from icecream import ic
+ic.configureOutput(includeContext=True)
+
 def parse_raw_camera(pose_raw):
     """Convert pose from camera_to_world to world_to_camera and follow the right, down, forward coordinate convention."""
     pose_flip = construct_pose(R=torch.diag(torch.tensor([1,-1,-1]))) # right, up, backward --> right down, forward
     pose = compose_poses([pose_flip, pose_raw[:3]])
     pose = invert_pose(pose) # world_from_camera --> camera_from_world
+    pose = compose_poses([pose_flip,pose])
     return pose
-    
+def center_camera_poses(poses):
+    # compute average pose
+    center = poses[...,3].mean(dim=0)
+    v1 = torch_F.normalize(poses[...,1].mean(dim=0),dim=0)
+    v2 = torch_F.normalize(poses[...,2].mean(dim=0),dim=0)
+    v0 = v1.cross(v2)
+    pose_avg = torch.stack([v0,v1,v2,center],dim=-1)[None] # [1,3,4]
+    # apply inverse of averaged pose
+    poses =compose_poses([poses,invert_pose(pose_avg)])
+    return poses
+def parse_cameras_and_bounds(path):
+    fname = "{}/poses_bounds.npy".format(path)
+    data = torch.tensor(np.load(fname),dtype=torch.float32)
+    # parse cameras (intrinsics and poses)
+    cam_data = data[:,:-2].view([-1,3,5]) # [N,3,5]
+    poses_raw = cam_data[...,:4] # [N,3,4]
+    poses_raw[...,0],poses_raw[...,1] = poses_raw[...,1],-poses_raw[...,0]
+    raw_H,raw_W,focal = cam_data[0,:,-1]
+    assert(raw_H==raw_H and raw_W==raw_W)
+    # parse depth bounds
+    bounds = data[:,-2:] # [N,2]
+    scale = 1./(bounds.min()*0.75) # not sure how this was determined
+    poses_raw[...,3] *= scale
+    bounds *= scale
+    # roughly center camera poses
+    poses_raw = center_camera_poses(poses_raw)
+    return focal,poses_raw,bounds
 
-def _load_renderings(root_fp: str, subject_id: str, split: str, factor: float):
-    """Load images from disk."""
+def _load_renderings(root_fp: str, subject_id: str, split: str, factor: float,scale: float):
+    """"return images, camfromworld, focal"""
     if not root_fp.startswith("/"):
         # allow relative path. e.g., "./data/nerf_synthetic/"
         root_fp = os.path.join(
@@ -38,20 +68,16 @@ def _load_renderings(root_fp: str, subject_id: str, split: str, factor: float):
             "..",
             root_fp,
         )
-
+    
     data_dir = os.path.join(root_fp, subject_id)
-    with open(
-        os.path.join(data_dir, "transforms_{}.json".format(split)), "r"
-    ) as fp:
-        meta = json.load(fp)
+    path_image = "{}/images_{}".format(data_dir,scale)
+    image_fnames = sorted(os.listdir(path_image))
+    
     images = []
     camfromworld = []
-
-    for i in range(len(meta["frames"])):
-        frame = meta["frames"][i]
-        fname = os.path.join(data_dir, frame["file_path"] + ".png")
-        rgba = imageio.imread(fname)
-        
+    for img in image_fnames:
+        name = "{}/{}".format(path_image,img)
+        rgba=imageio.imread(name)
         if rgba.shape[-1] == 3:
             alpha = np.ones_like(rgba[..., :1]) * 255
             rgba = np.concatenate([rgba, alpha], axis=-1)
@@ -60,19 +86,29 @@ def _load_renderings(root_fp: str, subject_id: str, split: str, factor: float):
             image = Image.fromarray(rgba)
             resized_image = image.resize((int(w/factor), int(h/factor)))
             rgba = np.array(resized_image)
-        w2c = parse_raw_camera(torch.tensor(frame["transform_matrix"], dtype=torch.float32))
-        camfromworld.append(w2c)
         images.append(rgba)
+        
+    focal,poses_raw,bounds = parse_cameras_and_bounds(data_dir)
+    
+    # parse the camera pose
+    for i in range(len(poses_raw)):
+        camfromworld.append(parse_raw_camera(poses_raw[i]))
+    # split the train val
+    num_val_split = int(len(poses_raw)*0.1)
+    images = images[:-num_val_split] if split=="train" else images[-num_val_split:]
+    poses = camfromworld[:-num_val_split] if split=="train" else camfromworld[-num_val_split:]
+    bounds = bounds[:-num_val_split] if split=="train" else bounds[-num_val_split:]
 
     images = torch.from_numpy(np.stack(images, axis=0)).to(torch.uint8)
-    
-    
-    camfromworld = torch.stack(camfromworld)
+    poses = torch.from_numpy(np.stack(poses, axis=0)).to(torch.float32)
 
-    h, w = images.shape[1:3]
-    camera_angle_x = float(meta["camera_angle_x"])
-    focal = 0.5 * w / np.tan(0.5 * camera_angle_x)
-    return images, camfromworld, focal
+    
+    max_bound=(bounds[:,1]-bounds[:,0]).max()
+    
+    
+    return images,poses,focal,max_bound
+
+   
 
 
 class SubjectLoader(torch.utils.data.Dataset):
@@ -80,23 +116,17 @@ class SubjectLoader(torch.utils.data.Dataset):
 
     SPLITS = ["train", "val", "trainval", "test"]
     SUBJECT_IDS = [
-        "chair",
-        "drums",
-        "ficus",
-        "hotdog",
-        "lego",
-        "materials",
-        "mic",
-        "ship",
-        "ball",
-        "car",
-        "coffee",
-        "helmet",
-        "teapot",
-        "toaster"
+        "fern",
+        "flower",
+        "fern",
+        "horns",
+        "leaves",
+        "orchids",
+        "room",
+        "trex",
+        "fortress"
     ]
 
-    RAW_WIDTH, RAW_HEIGHT = 800, 800
 
     def __init__(
         self,
@@ -105,52 +135,56 @@ class SubjectLoader(torch.utils.data.Dataset):
         split: str,
         color_bkgd_aug: str = "white",
         num_rays: int = None,
-        factor: float = 1,
+        factor: float = 4,
         batch_over_images: bool = True,
         device: torch.device = torch.device("cpu"),
         dof: int = 6,
         noise: float = 0.15
     ):
+        self.RAW_WIDTH, self.RAW_HEIGHT = 4032, 3024
         super().__init__()
         assert split in self.SPLITS, "%s" % split
         assert subject_id in self.SUBJECT_IDS, "%s" % subject_id
         assert color_bkgd_aug in ["white", "black", "random"]
+        self.load_image_scale=4
         self.split = split
         self.factor = factor
         self.color_bkgd_aug = color_bkgd_aug
         self.batch_over_images = batch_over_images
         self.noise = noise
         if split == "trainval":
-            _images_train, _camfromworld_train, _focal_train = _load_renderings(
-                root_fp, subject_id, "train", factor=factor
+            _images_train, _camfromworld_train, _focal_train ,self.max_bound= _load_renderings(
+                root_fp, subject_id, "train", factor=factor,scale=self.load_image_scale
             )
-            _images_val, _camfromworld_val, _ = _load_renderings(
-                root_fp, subject_id, "val", factor=factor
+            _images_val, _camfromworld_val, _ ,self.max_bound= _load_renderings(
+                root_fp, subject_id, "val", factor=factor,scale=self.load_image_scale
             )
-            images = torch.cat([_images_train, _images_val])
+            images ,self.max_bound= torch.cat([_images_train, _images_val])
             camfromworld = torch.cat(
                 [_camfromworld_train, _camfromworld_val]
             )
             self.focal = _focal_train            
         else:
-            images, camfromworld, self.focal = _load_renderings(
-                root_fp, subject_id, split, factor=factor
+            images, camfromworld, self.focal, self.max_bound = _load_renderings(
+                root_fp, subject_id, split, factor=factor,scale=self.load_image_scale
             )
             
         self.pyramid_level=4
         self.images_parimid=kornia.geometry.transform.build_pyramid(images.permute(0,3,1,2)/255., self.pyramid_level, border_type='replicate',align_corners=True)
         
-        assert images.shape[1:3] == (self.RAW_HEIGHT//factor, self.RAW_WIDTH//factor)
-        self.width, self.height = images.shape[1:3]
+        # assert images.shape[1:3] == (self.RAW_HEIGHT//factor, self.RAW_WIDTH//factor)
+        self.height,self.width = images.shape[1:3]
         K = torch.tensor(
             [
-                [self.focal, 0, self.width / 2.0],
-                [0, self.focal, self.height / 2.0],
+                [self.focal/self.load_image_scale/self.factor, 0, self.width / 2.0],
+                [0, self.focal/self.load_image_scale/self.factor, self.height / 2.0],
                 [0, 0, 1],
             ],
             dtype=torch.float32,
         )  # (3, 3)
         self.images = images.to(device)
+        
+        
         self.camfromworld = camfromworld.to(device)
         self.K = K.to(device)
         self.num_rays = num_rays
@@ -166,9 +200,6 @@ class SubjectLoader(torch.utils.data.Dataset):
         '''
         level : [0,1,2,3]
         '''
-        # ic(self.images.shape)
-        # ic(self.images.max())
-        # ic(self.images_parimid[level].shape)
         self.progress=0
         if level>0:
             upscale_image=kornia.geometry.transform.resize(torch.FloatTensor(self.images_parimid[level]),size=(self.images_parimid[0].shape[2],\
@@ -179,17 +210,12 @@ class SubjectLoader(torch.utils.data.Dataset):
         upper_upscale_image=kornia.geometry.transform.resize(torch.FloatTensor(self.images_parimid[upper_level]),size=(self.images_parimid[0].shape[2],\
                 self.images_parimid[0].shape[3]),align_corners=True)
         
-        # ic(upscale_image.shape)
         device=self.images.device
         self.images=self.images.to('cpu')
         self.images=upscale_image.to(device).permute(0,2,3,1)*255.
         self.upper_level_images=upper_upscale_image.to(device).permute(0,2,3,1)*255.
-        # ic(self.images.max())
-        
-        # ic(self.images.shape)
         imageio.imwrite(f'resize_test_{0}.png', self.images[0,:,:,:3].squeeze().cpu().numpy().astype(np.uint8))
         imageio.imwrite(f'resize_test_{1}.png', self.images[1,:,:,:3].squeeze().cpu().numpy().astype(np.uint8))
-        # exit()
     def __len__(self):
         return len(self.images)
 
@@ -279,6 +305,7 @@ class SubjectLoader(torch.utils.data.Dataset):
                 torch.arange(self.height, device=self.images.device),
                 indexing="xy",
             )
+            
                 
         # adds 0.5 here.
         xy_grid = torch.stack([x,y],dim=-1).view(-1, 2) + 0.5 # [HW,2] or [B, N_rays, 2]
