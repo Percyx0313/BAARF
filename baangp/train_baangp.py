@@ -19,6 +19,7 @@ from evaluation_utils import (
     prealign_cameras,
     pose_evaluate
 )
+from distortion import distortion_loss
 import importlib
 from lie_utils import se3_to_SE3,so3_t3_to_SE3
 from nerfacc.estimators.occ_grid import OccGridEstimator
@@ -40,6 +41,24 @@ from camera_utils import cam2world, rotation_distance, procrustes_analysis
 from pose_utils import construct_pose
 from utils import Rays
 from s3im import S3IM
+import taichi as ti
+
+def taichi_init(args):
+    taichi_init_args = {"arch": ti.cuda,}
+    ti.init(**taichi_init_args)
+
+def seed_everything(seed: int):
+    import random, os
+    import numpy as np
+    import torch
+    
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = True
 def save_camera_poses(args,train_dataset,outlier_ids : list =None,path="poses_outlier",name=None,pertubation_SE3=None):
     models["radiance_field"].eval()
     models["estimator"].eval()
@@ -287,6 +306,7 @@ if __name__ == "__main__":
     device = "cuda:0"
     
     set_random_seed(args.seed)
+    seed_everything(args.seed)
     if os.path.exists(args.save_dir):
         print('%s exists!'%args.save_dir)
     else:
@@ -294,20 +314,19 @@ if __name__ == "__main__":
         os.makedirs(args.save_dir, exist_ok=True)
 
     # training parameters
-    lr = 1.e-2  if args.dataset=='blender' else  1.e-2
+    lr = 1.e-2  if args.dataset=='blender' else  1.e-2 # 5e-3
     lr_end = 1.e-4 if args.dataset=='blender' else 1.e-4
     lr_pose_R = 3.e-3 if args.dataset=='blender' else  3.e-3#1.e-2
     lr_pose_T = 5.e-3 if args.dataset=='blender' else  3.e-3#1.e-2
     optim_lr_pose = 1.e-3
-    max_steps = 40000 if args.dataset=='blender' else 40000
-    init_batch_size = 1024
-    target_sample_batch_size = 1 << 18
+    max_steps = 40000 if args.dataset=='blender' else 20000
+    init_batch_size = 512
+    target_sample_batch_size = 1 << 12
     weight_decay = 1e-6
     
           
     # model parameters
     grid_resolution = 128
-    grid_nlvl = 1
     # render parameters
     alpha_thre = 0.0
     cone_angle = 0.0
@@ -321,7 +340,7 @@ if __name__ == "__main__":
     
     
     
-    
+    taichi_init(args)
     wandb.init(config=args,
                project="baangp",
                dir=args.save_dir,
@@ -363,6 +382,17 @@ if __name__ == "__main__":
     # scene parameters
     if args.dataset=='llff':
         aabb_scale=2**np.ceil(np.log2(train_dataset.max_bound))
+        
+        grid_nlvl = 2#int(np.ceil(np.log2(train_dataset.max_bound)))
+        if args.scene=='trex':
+            aabb_scale=16   
+        elif args.scene=='orchids': 
+            grid_nlvl =2#int(np.ceil(np.log2(train_dataset.max_bound)))
+            
+        ic("The grid level is ",grid_nlvl)    
+        ic("aabb scale is ",aabb_scale)    
+        
+        # aabb = torch.tensor([-2, -2, -2, 2, 2, 2], device=device)
         aabb = torch.tensor([-aabb_scale, -aabb_scale, -aabb_scale, aabb_scale, aabb_scale, aabb_scale], device=device)
         near_plane = 0
         ic(aabb_scale)
@@ -374,7 +404,7 @@ if __name__ == "__main__":
     else:
         assert False,"Need to give the known dataset"
     
-    render_step_size = 5e-3 if args.dataset=='blender' else 1e-2
+    render_step_size = 5e-3 if args.dataset=='blender' else aabb_scale/64
     target_render_step_size = 5e-3 if args.dataset=='blender' else 5e-3
     
     # re-localization 
@@ -399,7 +429,7 @@ if __name__ == "__main__":
     print(f"Setup Occupancy Grid. Grid resolution is {grid_resolution}")
 
     estimator = OccGridEstimator(
-        roi_aabb=aabb, resolution=grid_resolution, levels=grid_nlvl
+        roi_aabb=aabb, resolution=grid_resolution, levels=grid_nlvl#,contraction_type="UN_BOUNDED_SPHERE"
     ).to(device)
 
 
@@ -450,7 +480,7 @@ if __name__ == "__main__":
 
     models, optimizers, schedulers, epoch, iteration, has_checkpoint = load_ckpt(save_dir=args.save_dir, models=models, optimizers=optimizers, schedulers=schedulers)
     # training
-    current_pyramid_level=1
+    current_pyramid_level=0
     train_dataset.change_pyramid_img(level=current_pyramid_level)
     print(f"Update pyramid level to {current_pyramid_level}")
     
@@ -462,9 +492,13 @@ if __name__ == "__main__":
             models['radiance_field'].train()
             models["estimator"].train()
             
-            # linear increase the step size
-            # render_step_size = render_step_size + (target_render_step_size - render_step_size) * step / max_steps
             
+            
+            # linear increase the step size
+            # render_step_size = render_step_size + (target_render_step_size - render_step_size) * ((step / max_steps-0.1)/0.4)
+            
+            if render_step_size<5e-3 and  step%1000==0:
+                render_step_size/=2
             
             if (step//2500)>(3-current_pyramid_level) and current_pyramid_level>0:
                 current_pyramid_level-=1
@@ -495,6 +529,7 @@ if __name__ == "__main__":
                 step=step,
                 occ_eval_fn=occ_eval_fn,
                 occ_thre=1e-2,
+                warmup_steps=5000,
             )
 
             for key in optimizers:
@@ -505,7 +540,7 @@ if __name__ == "__main__":
 
             rays = models["radiance_field"].query_rays(idx=image_ids, grid_3D=grid_3D, gt_poses=gt_poses, mode='train')
             # render
-            rgb, acc, depth, n_rendering_samples,alphas_t = render_image_with_occgrid(
+            rgb, acc, depth, n_rendering_samples,alphas_t,ts_t,deltas_t,ws_t = render_image_with_occgrid(
                 radiance_field=models["radiance_field"],
                 estimator=models["estimator"],
                 rays=rays,
@@ -528,9 +563,13 @@ if __name__ == "__main__":
                 )
                 train_dataset.update_num_rays(num_rays)
 
+            # spec_reg_loss= torch.abs(models["radiance_field"].nerf.spec_rgb).mean()*0.1
+            # depth_loss=(depth-aabb_scale/2).abs().mean()
             
-            loss = F.smooth_l1_loss(rgb, pixels)#-0.001*torch.mean(alphas_t*torch.log(alphas_t+1e-8)+(1-alphas_t)*torch.log((1-alphas_t)+1e-8))#+0.001*feat_reg#+consistency_loss
             
+            # disto_loss = 0.3* distortion_loss(ws=ws_t,deltas=deltas_t,alphas=alphas_t,ts=ts_t).mean()
+            # entropy=-(ws_t*torch.log(ws_t+1.e-6)).mean()
+            loss = F.smooth_l1_loss(rgb, pixels)#+0.001*depth_loss#+entropy#+disto_loss
             # s3im loss
             
             # size= np.floor((rgb.shape[0])**0.5).astype(int)
@@ -749,12 +788,13 @@ if __name__ == "__main__":
 
 
 
-                if step % 100==0:
+                if step % 500==0:
                     print(
                         f"elapsed_time={elapsed_time:.2f}s | step={step} | "
                         f"loss={loss:.5f} | psnr={psnr:.2f} | "
                         f"n_rendering_samples={n_rendering_samples:d} | num_rays={len(pixels):d} | "
                         f"max_depth={depth.max():.3f} | "
+                        f"min_depth={depth.min():.3f} | "
                     )
                     
                     
@@ -769,8 +809,8 @@ if __name__ == "__main__":
                     # },step=step)
             # if step%10==0 and step!=0:
             #     validate(models , train_dataset, test_dataset,step=step)
-                # if step==7000:
-                #     exit()
+                if step==1000:
+                    exit()
         save_ckpt(save_dir=args.save_dir, iteration=step, models=models, optimizers=optimizers, schedulers=schedulers, final=True)
     else:
         step = iteration
@@ -908,4 +948,5 @@ if __name__ == "__main__":
     os.system("ffmpeg -y -framerate 30 -i {0}/depth_%d.png -pix_fmt yuv420p {1} >/dev/null 2>&1".format(test_dir, depth_vid_fname))
 
     print("Training and evaluation stops.")
-        
+
+

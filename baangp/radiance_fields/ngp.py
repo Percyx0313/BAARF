@@ -6,13 +6,14 @@ Copyright (c) 2022 Ruilong Li, UC Berkeley.
 # SPDX-License-Identifier: MIT License
 
 import numpy as np
-
+from typing import Callable, Optional
 import torch
 from torch.autograd import Function
 from torch.cuda.amp import custom_bwd, custom_fwd
 from typing import Callable, List, Union
 import torch
-
+from hash_encoder import HashEncoder
+import torch.nn as nn
 try:
     import tinycudann as tcnn
 except ImportError as e:
@@ -122,6 +123,10 @@ class ScaleHash(torch.nn.Module):
                 n_input_dims=3,
                 encoding_config=encoding_config,
             )
+            for l in self.tcnn_encoding.parameters():
+                # init the weight
+                torch.nn.init.uniform_(l,0,1e-4)
+            # exit()
         elif implementation == "torch":
             self.hash_table = torch.rand(size=(self.hash_table_size * n_levels, n_features_per_level)) * 2 - 1
             self.hash_table *= hash_init_scale
@@ -156,6 +161,9 @@ class ScaleHash(torch.nn.Module):
         x += self.hash_offset.to(x.device)
         return x
     
+    
+    def smooth_activate(self,weight):
+        return 0.5*(1-torch.cos(torch.pi*weight))
     def pytorch_fwd(self, in_tensor):
         """Forward pass using pytorch. Significantly slower than TCNN implementation."""
 
@@ -185,15 +193,15 @@ class ScaleHash(torch.nn.Module):
         f_6 = self.hash_table[hashed_6]
         f_7 = self.hash_table[hashed_7]
 
-        f_03 = f_0 * offset[..., 0:1] + f_3 * (1 - offset[..., 0:1])
-        f_12 = f_1 * offset[..., 0:1] + f_2 * (1 - offset[..., 0:1])
-        f_56 = f_5 * offset[..., 0:1] + f_6 * (1 - offset[..., 0:1])
-        f_47 = f_4 * offset[..., 0:1] + f_7 * (1 - offset[..., 0:1])
+        f_03 = f_0 * self.smooth_activate(offset[..., 0:1]) + f_3 * self.smooth_activate(1 - offset[..., 0:1])
+        f_12 = f_1 * self.smooth_activate(offset[..., 0:1]) + f_2 * self.smooth_activate(1 - offset[..., 0:1])
+        f_56 = f_5 * self.smooth_activate(offset[..., 0:1]) + f_6 * self.smooth_activate(1 - offset[..., 0:1])
+        f_47 = f_4 * self.smooth_activate(offset[..., 0:1]) + f_7 * self.smooth_activate(1 - offset[..., 0:1])
 
-        f0312 = f_03 * offset[..., 1:2] + f_12 * (1 - offset[..., 1:2])
-        f4756 = f_47 * offset[..., 1:2] + f_56 * (1 - offset[..., 1:2])
+        f0312 = f_03 * self.smooth_activate(offset[..., 1:2]) + f_12 * self.smooth_activate(1 - offset[..., 1:2])
+        f4756 = f_47 * self.smooth_activate(offset[..., 1:2]) + f_56 * self.smooth_activate(1 - offset[..., 1:2])
 
-        encoded_value = f0312 * offset[..., 2:3] + f4756 * (
+        encoded_value = f0312 * self.smooth_activate(offset[..., 2:3]) + f4756 * self.smooth_activate(
             1 - offset[..., 2:3]
         )  # [..., num_levels, features_per_level]
 
@@ -214,6 +222,7 @@ class ScaleHash(torch.nn.Module):
         L = N
         # From https://arxiv.org/pdf/2104.06405.pdf equation 14
         alpha = (self.step - start) / (end - start) * L
+        
         k = torch.arange(L, dtype=outputs.dtype, device=outputs.device)
         mask_vals = (1.0 - (alpha - k).clamp_(min=0, max=1).mul_(np.pi).cos_()) / 2
         mask_vals = mask_vals[None, ..., None].repeat((B, 1, D))
@@ -328,60 +337,58 @@ class NGPRadianceField(torch.nn.Module):
                 "activation": "ReLU",
                 "output_activation": "None",
                 "n_neurons": hidden_dim,
-                "n_hidden_layers": 4,
+                "n_hidden_layers": 2,
             }
+        
+        
+        ic(hidden_dim)
         # self.encoding = tcnn.Encoding(n_input_dims=num_dim, encoding_config=mlp_encoding_config)
-        self.encoding = ScaleHash(
-            aabb=aabb,
-            num_dim=num_dim,
-            num_layers=num_layers,
-            hidden_dim=hidden_dim,
-            num_layers_color=num_layers_color,
-            hidden_dim_color=hidden_dim_color,
-            n_features_per_level=n_features_per_level,
-            use_viewdirs=use_viewdirs,
-            density_activation=density_activation,
-            base_resolution=base_resolution,
-            max_resolution=max_resolution,
-            geo_feat_dim=geo_feat_dim,
-            n_levels=n_levels,
-            log2_hashmap_size=log2_hashmap_size,
-            c2f=[0.0,0.5],
-            implementation="tcnn",
-        )
-        self.mlp_base = tcnn.Network(n_input_dims=self.encoding.num_levels*self.encoding.features_per_level,
+        # self.encoding = ScaleHash(
+        #     aabb=aabb,
+        #     num_dim=num_dim,
+        #     num_layers=num_layers,
+        #     hidden_dim=hidden_dim,
+        #     num_layers_color=num_layers_color,
+        #     hidden_dim_color=hidden_dim_color,
+        #     n_features_per_level=n_features_per_level,
+        #     use_viewdirs=use_viewdirs,
+        #     density_activation=density_activation,
+        #     base_resolution=base_resolution,
+        #     max_resolution=max_resolution,
+        #     geo_feat_dim=geo_feat_dim,
+        #     n_levels=n_levels,
+        #     log2_hashmap_size=log2_hashmap_size,
+        #     c2f=[0.0,0.5],
+        #     implementation="tcnn",
+        # )
+        self.mlp_base = tcnn.Network(n_input_dims=n_levels*n_features_per_level,
                                      n_output_dims=1 + self.geo_feat_dim,
                                      network_config=network_config) 
+        self.mlp_base_pos = tcnn.Network(n_input_dims=4*6+3,
+                                     n_output_dims=1 + self.geo_feat_dim,
+                                     network_config=network_config) 
+        self.pos_encoder = HashEncoder(
+                max_params=2**log2_hashmap_size,
+                base_res=base_resolution,
+                max_res=max_resolution,
+                levels=n_levels,
+                feature_per_level=n_features_per_level,
+            )
         
+        self.base_mlp_torch = MLP(
+            input_dim=self.pos_encoder.out_dim,
+            output_dim=1+64,
+            net_depth=3,
+            net_width=64,
+            bias_enabled=False,
+        )
         
-        # self.mlp_all = torch.nn.Sequential(
-        #     torch.nn.Linear(self.encoding.get_out_dim()+4*6+3,hidden_dim),
-        #     torch.nn.ReLU(),
-        #     torch.nn.Linear(hidden_dim,hidden_dim),
-        #     torch.nn.ReLU(),
-        #     # torch.nn.Linear(hidden_dim,hidden_dim),
-        #     # torch.nn.ReLU(),
-        #     torch.nn.Linear(hidden_dim,1 + self.geo_feat_dim),
-        # )
-        # self.mlp_base1=   torch.nn.Linear(self.encoding.n_output_dims+4*6+3,hidden_dim)
-        # self.mlp_base1=   torch.nn.Linear(self.encoding.get_out_dim()+4*6+3,hidden_dim)
-        # self.mlp_base2=   torch.nn.Linear(hidden_dim,hidden_dim)
-        # self.mlp_base3=   torch.nn.Linear(hidden_dim,hidden_dim)
-        # self.mlp_base4=   torch.nn.Linear(hidden_dim,1 + self.geo_feat_dim)
-        
-        
-        # init the weights
-        # for L in self.mlp_base:
-        #     if isinstance(L, torch.nn.Linear):
-        #         torch.nn.init.kaiming_uniform_(L.weight)
-        
-        # ic(self.encoding.n_output_dims+4*6+3)
-        # ic(self.mlp_base)
         if self.geo_feat_dim > 0:
             self.mlp_head = tcnn.Network(
                 n_input_dims=(
                     (
-                        self.direction_encoding.n_output_dims
+                        # self.direction_encoding.n_output_dims
+                        4*6+3
                         if self.use_viewdirs
                         else 0
                     )
@@ -412,20 +419,19 @@ class NGPRadianceField(torch.nn.Module):
 
     def query_density(self, x, weights:torch.Tensor = None, return_feat: bool = False):
         
-        # start,end = self.c2f
-        # alpha = (self.progress.data-start)/(end-start)*4
-        # PE_x=self.positional_encoding(x.view(-1, self.num_dim),4,alpha)
-        # PE_x=torch.cat([x,PE_x],dim=-1)
+        start,end = 0,0.1
+        alpha = (self.progress.data-start)/(end-start)*4
+        PE_x=self.positional_encoding(x.view(-1, self.num_dim),4,1.0)
+        PE_x=torch.cat([x,PE_x],dim=-1)
         
         
         
         aabb_min, aabb_max = torch.split(self.aabb, self.num_dim, dim=-1)
         x = (x - aabb_min) / (aabb_max - aabb_min) # normalize
         
-        encoded_x = self.encoding(x.view(-1, self.num_dim)) # [N,32]
-        # ic(encoded_x.shape)
-        # self.var_loss=
-        # ic(weights)
+        # encoded_x = self.encoding(x.view(-1, self.num_dim)) # [N,32]
+        
+        encoded_x = self.pos_encoder(x.view(-1, self.num_dim)) # [N,32]
         if weights is not None:
             _, n_features = encoded_x.shape
             assert n_features == len(weights)
@@ -435,37 +441,42 @@ class NGPRadianceField(torch.nn.Module):
             if len(available_features) <= 0:
                 assert False, "no features are selected!"
             assert len(available_features) > 0
-            coarse_features = available_features[:, -self.n_features_per_level:]
+            # coarse_features = available_features[:, -self.n_features_per_level:]
+            # coarse_repeats = coarse_features.repeat(1, self.n_levels)
+            # encoded_x = encoded_x * weights + coarse_repeats * (1 - weights) 
+            
+            current_level=available_features.size(1)
+            if current_level>=4:
+                w=weights[current_level-1]
+                coarse_features = w*available_features[:, -self.n_features_per_level:] + (1-w)*available_features[:, -self.n_features_per_level-2:-self.n_features_per_level]
+            else:
+                coarse_features = available_features[:, -self.n_features_per_level:]
             coarse_repeats = coarse_features.repeat(1, self.n_levels)
             encoded_x = encoded_x * weights + coarse_repeats * (1 - weights) 
-
-        # encoded_x=torch.cat([encoded_x],dim=-1)
-        
-        # mlp base
-        # encoded_x = self.mlp_base1(encoded_x)
-        # encoded_x = torch.nn.functional.relu_(encoded_x)
-        # encoded_x = self.mlp_base2(encoded_x)
-        # encoded_x = torch.nn.functional.relu_(encoded_x)
-        # encoded_x = self.mlp_base3(encoded_x)
-        # encoded_x = torch.nn.functional.relu_(encoded_x)
-        # x = self.mlp_base4(encoded_x).view(list(x.shape[:-1]) + [1 + self.geo_feat_dim]).to(x)
-        # x = self.mlp_all(encoded_x).view(list(x.shape[:-1]) + [1 + self.geo_feat_dim]).to(x)
-        
+ 
+        # encoded_x=encoded_x.to(torch.float32)
+        # ic(encoded_x.shape,PE_x.shape)
+        # encoded_x=torch.cat([PE_x,encoded_x],dim=-1)
+        # ic(encoded_x.shape)
         x = (
+            # self.mlp_all(encoded_x)
             self.mlp_base(encoded_x)
             .view(list(x.shape[:-1]) + [1 + self.geo_feat_dim])
             .to(x)
         )
         
-
+        guide_x=self.mlp_base_pos(PE_x)
+        gdensity_before_activation, gbase_mlp_out = torch.split(
+            guide_x, [1, self.geo_feat_dim], dim=-1
+        )
         density_before_activation, base_mlp_out = torch.split(
             x, [1, self.geo_feat_dim], dim=-1
         )
         density = (
-            self.density_activation(density_before_activation)
+            self.density_activation(density_before_activation)*self.density_activation(gdensity_before_activation)
         )
         if return_feat:
-            return density, base_mlp_out
+            return density, base_mlp_out+gbase_mlp_out
         else:
             return density
 
@@ -473,11 +484,11 @@ class NGPRadianceField(torch.nn.Module):
         # tcnn requires directions in the range [0, 1]
         if self.use_viewdirs:
             dir = (dir + 1.0) / 2.0
-            # start,end = self.c2f
-            # alpha = (self.progress.data-start)/(end-start)*4
-            # d=self.positional_encoding(dir.reshape(-1, dir.shape[-1]),4,alpha)
-            d = self.direction_encoding(dir.reshape(-1, dir.shape[-1]))
-            h = torch.cat([d, embedding.reshape(-1, self.geo_feat_dim)], dim=-1)
+            start,end = self.c2f
+            alpha = (self.progress.data-start)/(end-start)*4
+            d=self.positional_encoding(dir.reshape(-1, dir.shape[-1]),4,alpha)
+            # d = self.direction_encoding(dir.reshape(-1, dir.shape[-1]))
+            h = torch.cat([dir,d, embedding.reshape(-1, self.geo_feat_dim)], dim=-1)
         else:
             h = embedding.reshape(-1, self.geo_feat_dim)
         rgb = (
@@ -485,6 +496,20 @@ class NGPRadianceField(torch.nn.Module):
             .reshape(list(embedding.shape[:-1]) + [3])
             .to(embedding)
         )
+        
+        
+        # self.diffuse_rgb=h[:,-3:]
+        # self.spec_rgb=(
+        #     self.mlp_head(h)
+        #     .reshape(list(embedding.shape[:-1]) + [3])
+        #     .to(embedding)
+        # )
+        
+        # rgb=self.diffuse_rgb+self.spec_rgb
+        
+        
+        
+        
         if apply_act:
             rgb = torch.sigmoid(rgb)
         return rgb
@@ -515,3 +540,94 @@ class NGPRadianceField(torch.nn.Module):
         pts = pts.reshape(
             positions.shape[:-1] + (freqs * 2 * positions.shape[-1], ))  # (..., DF)
         return pts
+    
+
+
+class MLP(torch.nn.Module):
+    '''
+        A simple MLP with skip connections from:
+        https://github.com/KAIR-BAIR/nerfacc/blob/master/examples/radiance_fields/mlp.py
+    '''
+
+    def __init__(
+        self,
+        input_dim: int,  # The number of input tensor channels.
+        output_dim: int = None,  # The number of output tensor channels.
+        net_depth: int = 8,  # The depth of the MLP.
+        net_width: int = 256,  # The width of the MLP.
+        skip_layer: int = 4,  # The layer to add skip layers to.
+        hidden_init: Callable = nn.init.xavier_uniform_,
+        hidden_activation: Callable = nn.ReLU(),
+        output_enabled: bool = True,
+        output_init: Optional[Callable] = nn.init.xavier_uniform_,
+        output_activation: Optional[Callable] = nn.Identity(),
+        bias_enabled: bool = True,
+        bias_init: Callable = nn.init.zeros_,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.net_depth = net_depth
+        self.net_width = net_width
+        self.skip_layer = skip_layer
+        self.hidden_init = hidden_init
+        self.hidden_activation = hidden_activation
+        self.output_enabled = output_enabled
+        self.output_init = output_init
+        self.output_activation = output_activation
+        self.bias_enabled = bias_enabled
+        self.bias_init = bias_init
+
+        self.hidden_layers = nn.ModuleList()
+        in_features = self.input_dim
+        for i in range(self.net_depth):
+            self.hidden_layers.append(
+                nn.Linear(in_features, self.net_width, bias=bias_enabled))
+            if ((self.skip_layer is not None) and (i % self.skip_layer == 0)
+                    and (i > 0)):
+                in_features = self.net_width + self.input_dim
+            else:
+                in_features = self.net_width
+        if self.output_enabled:
+            self.output_layer = nn.Linear(in_features,
+                                          self.output_dim,
+                                          bias=bias_enabled)
+        else:
+            self.output_dim = in_features
+
+        self.initialize()
+
+    def initialize(self):
+
+        def init_func_hidden(m):
+            if isinstance(m, nn.Linear):
+                if self.hidden_init is not None:
+                    self.hidden_init(m.weight)
+                if self.bias_enabled and self.bias_init is not None:
+                    self.bias_init(m.bias)
+
+        self.hidden_layers.apply(init_func_hidden)
+        if self.output_enabled:
+
+            def init_func_output(m):
+                if isinstance(m, nn.Linear):
+                    if self.output_init is not None:
+                        self.output_init(m.weight)
+                    if self.bias_enabled and self.bias_init is not None:
+                        self.bias_init(m.bias)
+
+            self.output_layer.apply(init_func_output)
+
+    # @torch.autocast(device_type="cuda", dtype=torch.float32)
+    def forward(self, x):
+        inputs = x
+        for i in range(self.net_depth):
+            x = self.hidden_layers[i](x)
+            x = self.hidden_activation(x)
+            if ((self.skip_layer is not None) and (i % self.skip_layer == 0)
+                    and (i > 0)):
+                x = torch.cat([x, inputs], dim=-1)
+        if self.output_enabled:
+            x = self.output_layer(x)
+            x = self.output_activation(x)
+        return x

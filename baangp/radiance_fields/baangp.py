@@ -114,8 +114,6 @@ class BAradianceField(torch.nn.Module):
                 # add learnable pose correction
                 poses = compose_poses([poses_refine, init_poses])
             else:
-                # pose_noises = self.pose_noise[idx]
-                # init_poses = compose_poses([pose_noises, gt_poses])
                 init_poses=self.pose_eye
                 # add learnable pose correction
                 assert idx is not None, "idx cannot be None during training."
@@ -175,6 +173,7 @@ class BAradianceField(torch.nn.Module):
     def update_progress(self, progress):
         self.progress.data.fill_(progress)
         self.nerf.progress.data.fill_(progress)
+        # self.nerf.encoding.set_step(progress)
     def get_refine_se3(self):
         se3_refine= torch.cat([self.se3_refine_R.weight, self.se3_refine_T.weight], dim=-1) # [B, 6]
         return se3_refine
