@@ -103,7 +103,7 @@ def evaluate_test_time_photometric_optim(
         sampled_origins = origins[ray_idx]
         sampled_viewdirs = viewdirs[ray_idx]
         sampled_rays = Rays(origins=sampled_origins, viewdirs=sampled_viewdirs)
-        rgb, _, _, n_rendering_samples,_ = render_image_with_occgrid(
+        rgb, _, _, n_rendering_samples,_,_,_,_ = render_image_with_occgrid(
             # scene
             radiance_field=radiance_field,
             estimator=estimator,
@@ -127,14 +127,17 @@ def evaluate_test_time_photometric_optim(
         iterator.set_postfix(loss="{:.3f}".format(loss))
     return gt_poses, pose_refine_test
 
-def pose_evaluate(se3_refine_R, se3_refine_T, pose_noise,gt_poses,dataset='blender'):
+def pose_evaluate(args,se3_refine_R, se3_refine_T, pose_noise,gt_poses,dataset='blender'):
     
     pose_refine = so3_t3_to_SE3(se3_refine_R, se3_refine_T)
     if dataset=='blender':
         pred_poses = compose_poses([pose_refine,pose_noise, gt_poses])
     else:
+        if args.eye_pose:
         # pose_init = torch.eye(3,4).to(pose_refine.device).detach()
-        pred_poses = pose_refine
+            pred_poses = pose_refine
+        else:
+            pred_poses = compose_poses([pose_refine,pose_noise, gt_poses])
         # print(pred_poses)
         
     pose_aligned, sim3 = prealign_cameras(pred_poses, gt_poses)

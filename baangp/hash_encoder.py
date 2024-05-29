@@ -85,12 +85,13 @@ def build_hash_encoder_kernel(
         block_dim = 256
     else:
         block_dim = hash_level
-
+ 
     @ti.kernel
     def hash_encoder_kernel(
             xyzs: ti.types.ndarray(), 
             table: ti.types.ndarray(),
             output_embedding: ti.types.ndarray(), 
+            stop_embedding: ti.types.ndarray(),
             hash_map_sizes: ti.types.ndarray(), 
             offsets: ti.types.ndarray(), 
             B: ti.i32,
@@ -112,7 +113,7 @@ def build_hash_encoder_kernel(
             map_size = hash_map_sizes[level]
 
             local_features = feat_vec(0.)
-
+            stop_local_features = feat_vec(0.)
             for idx in ti.static(range(8)):
                 w = 1.
                 pos_grid_local = uvec3(0)
@@ -136,11 +137,15 @@ def build_hash_encoder_kernel(
                 )
 
                 for l_f in ti.static(range(feat_dim)):
-                    local_features[l_f] += (1-ti.cos(w*torch.pi))/2 * table[index_table+l_f]
+                    # tmp=ti.Vector([0.0,0.0,0.0])
+                    # tmp[0]=table[index_table+l_f]*(1-ti.cos(w*torch.pi))/2
+                    local_features[l_f] += table[index_table+l_f]*w+table[index_table+l_f]*(1-ti.cos(w*torch.pi))/2*2
+                    stop_local_features=table[index_table+l_f]*(1-ti.cos(w*torch.pi))/2*2
 
             out_index_base = level * feat_dim 
             for l_f in ti.static(range(feat_dim)):
                 output_embedding[i, out_index_base + l_f] = local_features[l_f]
+                stop_embedding[i,out_index_base+l_f]=stop_local_features[l_f]
 
     return hash_encoder_kernel
 
@@ -245,10 +250,19 @@ class HashEncoder(torch.nn.Module):
                     device=input_pos.device, 
                     requires_grad=True,
                 )
+                
+                
+                stop_output_embedding = torch.empty(
+                    input_pos.shape[0], self.out_dim,
+                    dtype=torch_type,
+                    device=input_pos.device, 
+                    requires_grad=True,
+                )
                 self._hash_encoder_kernel(
                     input_pos,
                     params,
                     output_embedding,
+                    stop_output_embedding,
                     self.hash_map_sizes,
                     self.offsets,
                     input_pos.shape[0],
@@ -256,31 +270,34 @@ class HashEncoder(torch.nn.Module):
                 ctx.save_for_backward(
                     input_pos, 
                     output_embedding, 
-                    params
+                    stop_output_embedding,
+                    params,
                 )
 
-                return output_embedding
+                return output_embedding,stop_output_embedding
 
             @staticmethod
-            def backward(ctx, doutput):
-                input_pos, output_embedding, params = ctx.saved_tensors
+            def backward(ctx, doutput,dstopoutput):
+                input_pos, output_embedding,stop_output_embedding, params = ctx.saved_tensors
                 output_embedding.grad = doutput
 
                 self._hash_encoder_kernel.grad(
                     input_pos,
                     params,
                     output_embedding,
+                    stop_output_embedding,
                     self.hash_map_sizes,
                     self.offsets,
                     input_pos.shape[0],
                 )
-                return input_pos.grad, params.grad
+                
+                return input_pos.grad, params.grad,None
 
         self._module_function = _module_function.apply
         
     def forward(self, positions):
         return self._module_function(
             positions.contiguous(), 
-            self.hash_table.contiguous(),
+            self.hash_table.contiguous()
         )
     

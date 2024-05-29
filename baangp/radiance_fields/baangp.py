@@ -19,6 +19,7 @@ class BAradianceField(torch.nn.Module):
     """Bundle-Ajusting radiance field."""
     def __init__(
         self,
+        args,
         num_frame: int,  # The number of frames.
         aabb: typing.Union[torch.Tensor, typing.List[float]],
         num_layers: int = 2,
@@ -58,12 +59,13 @@ class BAradianceField(torch.nn.Module):
         self.c2f = c2f
 
         # noise addition for blender.
-        
-        se3_noise = torch.randn(num_frame, dof, device=device) *0.15  #0.15
+        self.noise_level=args.noise_level
+        se3_noise = torch.randn(num_frame, dof, device=device) *self.noise_level  #0.15
         self.pose_noise = se3_to_SE3(se3_noise)
         # Learnable embedding. 
         self.se3_refine_R = torch.nn.Embedding(num_frame, dof//2, device=device)
         self.se3_refine_T = torch.nn.Embedding(num_frame, dof//2, device=device)
+        self.depth_scale = torch.nn.Embedding(num_frame,2, device=device)
         torch.nn.init.zeros_(self.se3_refine_R.weight)
         torch.nn.init.zeros_(self.se3_refine_T.weight)
         # TODO:see if we want to register buffer for this variable.
@@ -76,6 +78,9 @@ class BAradianceField(torch.nn.Module):
         # for LLFF
         self.pose_eye = torch.eye(3,4).to(device).detach()
         self.dataset= dataset
+        
+        self.eye_pose=args.eye_pose
+        
 
     def query_density(self, x, occ_sample=False):
         if self.c2f is None or (self.testing and not occ_sample):
@@ -115,6 +120,7 @@ class BAradianceField(torch.nn.Module):
                 poses = compose_poses([poses_refine, init_poses])
             else:
                 init_poses=self.pose_eye
+                
                 # add learnable pose correction
                 assert idx is not None, "idx cannot be None during training."
                 se3_refine_R = self.se3_refine_R.weight[idx] # [B, 3] idx corresponds to frame number.
@@ -173,7 +179,7 @@ class BAradianceField(torch.nn.Module):
     def update_progress(self, progress):
         self.progress.data.fill_(progress)
         self.nerf.progress.data.fill_(progress)
-        # self.nerf.encoding.set_step(progress)
+        self.nerf.custom_encoder.set_step(progress)
     def get_refine_se3(self):
         se3_refine= torch.cat([self.se3_refine_R.weight, self.se3_refine_T.weight], dim=-1) # [B, 6]
         return se3_refine
