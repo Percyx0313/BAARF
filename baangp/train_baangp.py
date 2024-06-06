@@ -108,7 +108,8 @@ def validate(models , train_dataset, test_dataset,step=0):
                       models["radiance_field"].se3_refine_T.weight,
                       models["radiance_field"].pose_noise,
                       gt_poses,
-                      dataset='llff')
+                      dataset='llff',
+                      optim_pose=args.optim_pose)
         
         ic(sim3.t0, sim3.t1, sim3.s0, sim3.s1, sim3.R)
         print("--------------------------")
@@ -269,6 +270,15 @@ if __name__ == "__main__":
         action="store_true",
     )
     
+    parser.add_argument(
+        "--optim_pose",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--gt_camera",
+        action="store_true",
+    )
+    
 
     parser.add_argument("--save-dir", type=str,
         required=True,
@@ -294,21 +304,21 @@ if __name__ == "__main__":
     # training parameters
     lr = 1.e-2  if args.dataset=='blender' else  1.e-2
     lr_end = 1.e-4 if args.dataset=='blender' else 1.e-4
-    lr_pose_R = 3.e-3 if args.dataset=='blender' else  5.e-2#1.e-2
-    lr_pose_T = 5.e-3 if args.dataset=='blender' else  3.e-2#1.e-2
-    optim_lr_pose = 1.e-3
+    lr_pose_R = 3.e-3 if args.dataset=='blender' else  3.e-3#1.e-2
+    lr_pose_T = 5.e-3 if args.dataset=='blender' else  3.e-3#1.e-2
+    optim_lr_pose = 1.e-4
     max_steps = 40000 if args.dataset=='blender' else 20000
     init_batch_size = 1024
     target_sample_batch_size = 1 << 18
     weight_decay = 1e-6
-    
+    warm_up_steps=100
           
     # model parameters
     grid_resolution = 128
     grid_nlvl = 1
     # render parameters
-    alpha_thre = 0.0
-    cone_angle = 0.0
+    alpha_thre = 0 #@0.01
+    cone_angle = 0.004
 
     #
     ema_alpha=0.9
@@ -361,10 +371,14 @@ if __name__ == "__main__":
     # scene parameters
     if args.dataset=='llff':
         aabb_scale=2**np.ceil(np.log2(train_dataset.max_bound))
+        
+        aabb_scale=1.5
+        grid_nlvl = 4
+        
         aabb = torch.tensor([-aabb_scale, -aabb_scale, -aabb_scale, aabb_scale, aabb_scale, aabb_scale], device=device)
-        near_plane = 0
+        near_plane = 0.05
         ic(aabb_scale)
-        far_plane = aabb_scale*np.sqrt(3)
+        far_plane =1000
     elif args.dataset=='blender':
         aabb = torch.tensor([-1.5, -1.5, -1.5, 1.5, 1.5, 1.5], device=device)
         near_plane = 0.0
@@ -372,7 +386,7 @@ if __name__ == "__main__":
     else:
         assert False,"Need to give the known dataset"
     
-    render_step_size = 5e-3 if args.dataset=='blender' else 1e-2
+    render_step_size = 5e-3 if args.dataset=='blender' else ((aabb[3:] - aabb[:3]) ** 2).sum().sqrt().item() / 1000 
     target_render_step_size = 5e-3 if args.dataset=='blender' else 5e-3
     
     # re-localization 
@@ -410,7 +424,7 @@ if __name__ == "__main__":
         device=device,
         c2f=args.c2f,
         dataset=args.dataset,
-        geo_feat_dim=32
+        geo_feat_dim=15
         ).to(device)
     
     print("Setting up optimizers...")
@@ -431,15 +445,17 @@ if __name__ == "__main__":
     schedulers={"scheduler": scheduler}
     optimizers={"optimizer": optimizer}
 
-    pose_optimizer = torch.optim.Adam(
-        [{'params':models['radiance_field'].se3_refine_R.parameters(), 'lr':lr_pose_R},
-         {'params':models['radiance_field'].se3_refine_T.parameters(), 'lr':lr_pose_T}],betas=[0.9,0.99])
-    pose_scheduler = torch.optim.lr_scheduler.ExponentialLR(
-        pose_optimizer,
-        gamma=(1.e-2)**(1./max_steps)
-    )
-    schedulers["pose_scheduler"] = pose_scheduler
-    optimizers["pose_optimizer"] = pose_optimizer
+    
+    if args.optim_pose==True:
+        pose_optimizer = torch.optim.Adam(
+            [{'params':models['radiance_field'].se3_refine_R.parameters(), 'lr':lr_pose_R},
+            {'params':models['radiance_field'].se3_refine_T.parameters(), 'lr':lr_pose_T}],betas=[0.9,0.99])
+        pose_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+            pose_optimizer,
+            gamma=(1.e-2)**(1./max_steps)
+        )
+        schedulers["pose_scheduler"] = pose_scheduler
+        optimizers["pose_optimizer"] = pose_optimizer
 
     lpips_net = LPIPS(net="vgg").to(device)
     lpips_norm_fn = lambda x: x[None, ...].permute(0, 3, 1, 2) * 2 - 1
@@ -448,7 +464,7 @@ if __name__ == "__main__":
 
     models, optimizers, schedulers, epoch, iteration, has_checkpoint = load_ckpt(save_dir=args.save_dir, models=models, optimizers=optimizers, schedulers=schedulers)
     # training
-    current_pyramid_level=3
+    current_pyramid_level=0
     train_dataset.change_pyramid_img(level=current_pyramid_level)
     print(f"Update pyramid level to {current_pyramid_level}")
     
@@ -493,6 +509,7 @@ if __name__ == "__main__":
                 step=step,
                 occ_eval_fn=occ_eval_fn,
                 occ_thre=1e-2,
+                warmup_steps=5000,
             )
 
             for key in optimizers:
@@ -514,6 +531,10 @@ if __name__ == "__main__":
                 cone_angle=cone_angle,
                 alpha_thre=alpha_thre,
             )
+            
+            
+            # print(rgb.shape,depth.shape)
+            
             if n_rendering_samples == 0:
                 loader.set_postfix(it=step, loss="skipped")
                 continue
@@ -525,15 +546,24 @@ if __name__ == "__main__":
                     num_rays * (target_sample_batch_size / float(n_rendering_samples))
                 )
                 train_dataset.update_num_rays(num_rays)
-
             
-            loss = F.smooth_l1_loss(rgb, pixels)#-0.001*torch.mean(alphas_t*torch.log(alphas_t+1e-8)+(1-alphas_t)*torch.log((1-alphas_t)+1e-8))#+0.001*feat_reg#+consistency_loss
+            # cluster density loss
             
+            # print(alphas_t.min(),alphas_t.max())
+            # smaple_id=torch.randint(0,alphas_t.shape[0],(512,))
+            # random_alpha=alphas_t[smaple_id].clip(1e-5,0.99)
+            # density_reg=-0.01*torch.mean(random_alpha*torch.log(random_alpha)+(1-random_alpha)*torch.log(((1-random_alpha))))
+            
+            # smaple_id=torch.randint(0,models["radiance_field"].nerf.density.shape[0]-1,(1024,))
+            # smaple_density_distance=models["radiance_field"].nerf.density[smaple_id]-models["radiance_field"].nerf.density[smaple_id+1]
+            # density_reg=(smaple_density_distance.abs()).mean()*0.05
+            loss = F.smooth_l1_loss(rgb, pixels)#+density_reg#-0.001*torch.mean(alphas_t*torch.log(alphas_t+1e-8)+(1-alphas_t)*torch.log((1-alphas_t)+1e-8))#+0.001*feat_reg#+consistency_loss
+            # ic(loss)
             # s3im loss
             
-            size= np.floor((rgb.shape[0])**0.5).astype(int)
-            s3im_loss = s3im(rgb[:size**2], pixels[:size**2],size,size)
-            loss+=0.1*s3im_loss
+            # size= np.floor((rgb.shape[0])**0.5).astype(int)
+            # s3im_loss = s3im(rgb[:size**2], pixels[:size**2],size,size)
+            # loss+=0.5*s3im_loss
             
             # with torch.no_grad():
             #     re_localize_error_list*=0.9
@@ -544,24 +574,44 @@ if __name__ == "__main__":
             
             
 
-            
+            # linear warpup the optimizers
+            if step < warm_up_steps:
+                waprm_up_lr = 1e-4 + (lr - 1e-4) * step / warm_up_steps
+                waprm_up_pose_lr = 1e-4 + (lr_pose_R - 1e-4) * step / warm_up_steps
+                origin_lr={}
+                for key in optimizers:
+                    for param_group in optimizers[key].param_groups:
+                        origin_lr[key]=param_group["lr"]
+                        param_group["lr"] = waprm_up_lr
+                if args.optim_pose:
+                    for param_group in pose_optimizer.param_groups:
+                        param_group["lr"] = waprm_up_pose_lr
             
             # do not unscale it because we are using Adam.
             scaled_train_loss = grad_scaler.scale(loss)
             scaled_train_loss.backward()
             for key in optimizers:
                 optimizers[key].step()
+                
+            
+            if step < warm_up_steps:
+                for key in optimizers:
+                    for param_group in optimizers[key].param_groups:
+                        param_group["lr"] =origin_lr[key]
+                        
+                
+                
             for key in schedulers:
                 schedulers[key].step()
             loader.set_postfix(it=step, loss="{:.4f}".format(scaled_train_loss.item()))
 
             # EMA pose
             
-            with torch.no_grad():
-                ema_alpha=min(ema_ratio*ema_alpha,0.99)
-                # ic(ema_alpha)
-                models["radiance_field"].se3_refine_R.weight.data=((1-ema_alpha)*models["radiance_field"].se3_refine_R.weight+ema_alpha*old_pose_R)
-                models["radiance_field"].se3_refine_T.weight.data=((1-ema_alpha)*models["radiance_field"].se3_refine_T.weight+ema_alpha*old_pose_T)
+            # with torch.no_grad():
+            #     ema_alpha=min(ema_ratio*ema_alpha,0.99)
+            #     # ic(ema_alpha)
+            #     models["radiance_field"].se3_refine_R.weight.data=((1-ema_alpha)*models["radiance_field"].se3_refine_R.weight+ema_alpha*old_pose_R)
+            #     models["radiance_field"].se3_refine_T.weight.data=((1-ema_alpha)*models["radiance_field"].se3_refine_T.weight+ema_alpha*old_pose_T)
             
             if(args.reloc==True and step%1000==0 and step >5000):
                 ic(models["radiance_field"].se3_refine_R.weight[outlier_id])
@@ -786,8 +836,9 @@ if __name__ == "__main__":
         if args.dataset=='blender':
             pred_poses = compose_poses([pose_refine, models["radiance_field"].pose_noise, gt_poses])
         else:
-            
             pred_poses= so3_t3_to_SE3(models["radiance_field"].se3_refine_R.weight, models["radiance_field"].se3_refine_T.weight)
+        if args.optim_pose==False:
+            pred_poses=gt_poses
         pose_aligned, sim3 = prealign_cameras(pred_poses, gt_poses)
         error = evaluate_camera_alignment(pose_aligned, gt_poses)
         rot_error = np.rad2deg(error.R.mean().item())

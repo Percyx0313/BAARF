@@ -127,7 +127,7 @@ def evaluate_test_time_photometric_optim(
         iterator.set_postfix(loss="{:.3f}".format(loss))
     return gt_poses, pose_refine_test
 
-def pose_evaluate(se3_refine_R, se3_refine_T, pose_noise,gt_poses,dataset='blender'):
+def pose_evaluate(se3_refine_R, se3_refine_T, pose_noise,gt_poses,dataset='blender',optim_pose=True):
     
     pose_refine = so3_t3_to_SE3(se3_refine_R, se3_refine_T)
     if dataset=='blender':
@@ -136,7 +136,9 @@ def pose_evaluate(se3_refine_R, se3_refine_T, pose_noise,gt_poses,dataset='blend
         # pose_init = torch.eye(3,4).to(pose_refine.device).detach()
         pred_poses = pose_refine
         # print(pred_poses)
-        
+    if optim_pose==False:
+        pred_poses=gt_poses
+    
     pose_aligned, sim3 = prealign_cameras(pred_poses, gt_poses)
     error = evaluate_camera_alignment(pose_aligned, gt_poses)
     rot_error = np.rad2deg(error.R.mean().item())

@@ -71,12 +71,16 @@ def _load_renderings(root_fp: str, subject_id: str, split: str, factor: float,sc
     
     data_dir = os.path.join(root_fp, subject_id)
     path_image = "{}/images_{}".format(data_dir,scale)
+    path_depth_image = "{}/depth_{}".format(data_dir,scale)
     image_fnames = sorted(os.listdir(path_image))
+    depth_image_fnames = sorted(os.listdir(path_depth_image))
     
     images = []
     camfromworld = []
+    depths=[]
     for img in image_fnames:
         name = "{}/{}".format(path_image,img)
+        # print(name)
         rgba=imageio.imread(name)
         if rgba.shape[-1] == 3:
             alpha = np.ones_like(rgba[..., :1]) * 255
@@ -87,6 +91,21 @@ def _load_renderings(root_fp: str, subject_id: str, split: str, factor: float,sc
             resized_image = image.resize((int(w/factor), int(h/factor)))
             rgba = np.array(resized_image)
         images.append(rgba)
+        
+        depths.append(rgba)
+    # for img in depth_image_fnames:
+    #     name = "{}/{}".format(path_depth_image,img)
+    #     # print(name)
+    #     rgba=imageio.imread(name)
+        
+    #     if factor != 1:
+    #         h, w = rgba.shape[:2]
+    #         image = Image.fromarray(rgba)
+    #         resized_image = image.resize((int(w/factor), int(h/factor)))
+    #         rgba = np.array(resized_image)
+    #     gray_frames = np.dot(rgba, [0.2989, 0.5870, 0.1140])
+        
+    #     depths.append(gray_frames)
         
     focal,poses_raw,bounds = parse_cameras_and_bounds(data_dir)
     
@@ -100,13 +119,14 @@ def _load_renderings(root_fp: str, subject_id: str, split: str, factor: float,sc
     bounds = bounds[:-num_val_split] if split=="train" else bounds[-num_val_split:]
 
     images = torch.from_numpy(np.stack(images, axis=0)).to(torch.uint8)
+    depths = torch.from_numpy(np.stack(depths, axis=0)).to(torch.uint8)
     poses = torch.from_numpy(np.stack(poses, axis=0)).to(torch.float32)
 
     
     max_bound=(bounds[:,1]-bounds[:,0]).max()
     
     
-    return images,poses,focal,max_bound
+    return images,depths,poses,focal,max_bound
 
    
 
@@ -153,19 +173,20 @@ class SubjectLoader(torch.utils.data.Dataset):
         self.batch_over_images = batch_over_images
         self.noise = noise
         if split == "trainval":
-            _images_train, _camfromworld_train, _focal_train ,self.max_bound= _load_renderings(
+            _images_train,_depths_train, _camfromworld_train, _focal_train ,self.max_bound= _load_renderings(
                 root_fp, subject_id, "train", factor=factor,scale=self.load_image_scale
             )
-            _images_val, _camfromworld_val, _ ,self.max_bound= _load_renderings(
+            _images_val,_depths_val, _camfromworld_val, _ ,self.max_bound= _load_renderings(
                 root_fp, subject_id, "val", factor=factor,scale=self.load_image_scale
             )
-            images ,self.max_bound= torch.cat([_images_train, _images_val])
+            images = torch.cat([_images_train, _images_val])
+            depths= torch.cat([_depths_train, _depths_val])
             camfromworld = torch.cat(
                 [_camfromworld_train, _camfromworld_val]
             )
             self.focal = _focal_train            
         else:
-            images, camfromworld, self.focal, self.max_bound = _load_renderings(
+            images, depths,camfromworld, self.focal, self.max_bound = _load_renderings(
                 root_fp, subject_id, split, factor=factor,scale=self.load_image_scale
             )
             
@@ -183,7 +204,7 @@ class SubjectLoader(torch.utils.data.Dataset):
             dtype=torch.float32,
         )  # (3, 3)
         self.images = images.to(device)
-        
+        self.depths=depths.to(device)
         
         self.camfromworld = camfromworld.to(device)
         self.K = K.to(device)

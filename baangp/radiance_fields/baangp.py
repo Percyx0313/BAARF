@@ -35,7 +35,8 @@ class BAradianceField(torch.nn.Module):
         num_input_dim: int = 3,
         device: str = 'cpu',
         testing: bool = False,
-        dataset: str ='blender'
+        dataset: str ='blender',
+        use_gt_camera: bool = False,
     ) -> None:
         super().__init__()
         
@@ -76,6 +77,9 @@ class BAradianceField(torch.nn.Module):
         # for LLFF
         self.pose_eye = torch.eye(3,4).to(device).detach()
         self.dataset= dataset
+        
+        
+        self.use_gt_camera = use_gt_camera
 
     def query_density(self, x, occ_sample=False):
         if self.c2f is None or (self.testing and not occ_sample):
@@ -137,6 +141,9 @@ class BAradianceField(torch.nn.Module):
             # additionally factorize the remaining pose imperfection
             if test_photo and mode != "val":
                 poses = compose_poses([pose_refine_test, poses])
+                
+        if self.use_gt_camera==True:
+            return gt_poses
         return poses
 
     def query_rays(self, grid_3D, idx=None, sim3=None,

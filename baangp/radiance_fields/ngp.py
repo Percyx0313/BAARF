@@ -159,10 +159,11 @@ class NGPRadianceField(torch.nn.Module):
             }
         
         self.encoding = tcnn.Encoding(n_input_dims=num_dim, encoding_config=mlp_encoding_config)
+        self.encoding2 = tcnn.Encoding(n_input_dims=num_dim, encoding_config=mlp_encoding_config)
         
         
         
-        self.mlp_base = tcnn.Network(n_input_dims=self.encoding.n_output_dims,#+8*6+3, 
+        self.mlp_base = tcnn.Network(n_input_dims=self.encoding.n_output_dims, 
                                      n_output_dims=1 +self.geo_feat_dim,
                                      network_config=network_config) 
         
@@ -202,20 +203,47 @@ class NGPRadianceField(torch.nn.Module):
                     "n_hidden_layers": num_layers_color - 1,
                 },
             )
+    def GaussianConv1d(self, x, kernel_size, stride=1, padding=0, dilation=1, groups=1):
+        # x: [B, C, L]
+        # kernel: [C, K]
+        # output: [B, C, L]
+        B, C, L = x.size()
+        K = kernel_size
+        # pad = (K - 1) * dilation - padding
+        pad = padding
+        x = torch.nn.functional.pad(x, (pad, pad))
+        x = x.unfold(2, K, stride)
+        x = x.view(B, C, -1, K)
+        kernel = torch.randn(C, K).to(x)
+        x = x * kernel.unsqueeze(0).unsqueeze(-1)
+        x = x.sum(-1)
+        return x
 
+    def contract(self,x):
+        mag = torch.linalg.norm(x, dim=-1)[..., None]
+        return torch.where(mag < 1, x, (2 - (1 / mag)) * (x / mag))
     def query_density(self, x, weights:torch.Tensor = None, return_feat: bool = False):
         
-        start,end = self.c2f
-        alpha = (self.progress.data-start)/(end-start)*4
-        PE_x=self.positional_encoding(x.view(-1, self.num_dim),6)
-        PE_x=torch.cat([x,PE_x],dim=-1)
+        # start,end = self.c2f
+        # alpha = (self.progress.data-start)/(end-start)*4
+        # # x=self.contract(x)
+        # inverse_x=1/(x+1e-6)
+        # PE_x=self.positional_encoding(inverse_x.view(-1, self.num_dim),4,alpha)
+        # PE_x=torch.cat([inverse_x,PE_x],dim=-1)
         
         
            
         aabb_min, aabb_max = torch.split(self.aabb, self.num_dim, dim=-1)
-        x = (x - aabb_min) / (aabb_max - aabb_min) # normalize
         
+        x=self.contract(x) # o [-2,2]
+        norm_x=torch.norm(x,dim=-1)
+        # x=(x+2)/(4) # normalize
+        # x = (x - aabb_min) / (aabb_max - aabb_min) # normalize
         encoded_x = self.encoding(x.view(-1, self.num_dim)) # [N,32]
+        
+        # 
+        
+        # encoded_x[norm_x>=1] = self.encoding2(x[norm_x>=1].view(-1, self.num_dim)) # [N,32]
         if weights is not None:
             _, n_features = encoded_x.shape
             assert n_features == len(weights)
@@ -244,9 +272,15 @@ class NGPRadianceField(torch.nn.Module):
             encoded_x = encoded_x * weights + coarse_repeats * (1 - weights) 
 
         # encoded_x=torch.cat([encoded_x,PE_x],dim=-1)
-        encoded_x=encoded_x.to(torch.float32)
+        # encoded_x=encoded_x.to(torch.float32)
+        
+        
+        # ic(PE_x.shape)
+        # ic(encoded_x.shape)
+        # encoded_x=torch.cat([encoded_x,PE_x],dim=-1)
+        # ic(encoded_x.shape)
         x = (
-            self.mlp_base_torch(encoded_x)
+            self.mlp_base(encoded_x)
             .view(list(x.shape[:-1]) + [1 + self.geo_feat_dim])
             .to(x)
         )
@@ -256,23 +290,23 @@ class NGPRadianceField(torch.nn.Module):
             x, [1, self.geo_feat_dim], dim=-1
         )
         
-        
         density = (
             self.density_activation(density_before_activation)
         )
+        self.density=density
         
         
-        x_guide=self.depth_mlp(PE_x)
-        density_before_activation_guide, base_mlp_out_guide = torch.split(
-            x_guide, [1, self.geo_feat_dim], dim=-1
-        )
-        density_guide = (
-            self.density_activation(density_before_activation_guide)
-        )
+        # x_guide=self.depth_mlp(PE_x)
+        # density_before_activation_guide, base_mlp_out_guide = torch.split(
+        #     x_guide, [1, self.geo_feat_dim], dim=-1
+        # )
+        # density_guide = (
+        #     self.density_activation(density_before_activation_guide)
+        # )
         if return_feat:
-            return density*density_guide, base_mlp_out+encoded_x+base_mlp_out_guide
+            return density, base_mlp_out#+encoded_x+base_mlp_out_guide*density_guide*density_guide
         else:
-            return density*density_guide
+            return density
 
     def _query_rgb(self, dir, embedding, apply_act: bool = True):
         # tcnn requires directions in the range [0, 1]
