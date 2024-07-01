@@ -101,6 +101,20 @@ class BAradianceField(torch.nn.Module):
             return self.nerf(positions, directions)
         return self.nerf(positions, directions, weights=self.get_weights())
 
+    
+    def get_all_noise_pose(self,gt_poses):
+        pose_noises = self.pose_noise
+        init_poses = compose_poses([pose_noises, gt_poses])
+        # add learnable pose correction
+        se3_refine_R = self.se3_refine_R.weight # [B, 3] idx corresponds to frame number.
+        se3_refine_T = self.se3_refine_T.weight # [B, 3] idx corresponds to frame number.
+        # se3_refine= torch.cat([se3_refine_R, se3_refine_T], dim=-1) # [B, 3]
+        poses_refine = so3_t3_to_SE3(se3_refine_R,se3_refine_T) # [1, 3, 4]
+        # add learnable pose correction
+        poses = compose_poses([poses_refine, init_poses])
+        if self.use_gt_camera==True:
+            return gt_poses
+        return poses
     def get_poses(self, idx=None, sim3=None, gt_poses=None, pose_refine_test=None, test_photo=True, mode='train'):
         
         if mode=='train':
@@ -182,6 +196,7 @@ class BAradianceField(torch.nn.Module):
     def update_progress(self, progress):
         self.progress.data.fill_(progress)
         self.nerf.progress.data.fill_(progress)
+        self.nerf.encoding.set_step(progress)
     def get_refine_se3(self):
         se3_refine= torch.cat([self.se3_refine_R.weight, self.se3_refine_T.weight], dim=-1) # [B, 6]
         return se3_refine

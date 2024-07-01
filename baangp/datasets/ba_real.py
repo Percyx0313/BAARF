@@ -17,12 +17,13 @@ import torch.nn.functional as torch_F
 sys.path.append("..")
 
 from camera_utils import img2cam
-from lie_utils import se3_to_SE3
+from lie_utils import se3_to_SE3,SE3_to_se3
 from pose_utils import to_hom, construct_pose, compose_poses, invert_pose
 import kornia
 from icecream import ic
 ic.configureOutput(includeContext=True)
-
+from LightGlue.lightglue import LightGlue, SuperPoint
+from einops import rearrange
 def parse_raw_camera(pose_raw):
     """Convert pose from camera_to_world to world_to_camera and follow the right, down, forward coordinate convention."""
     pose_flip = construct_pose(R=torch.diag(torch.tensor([1,-1,-1]))) # right, up, backward --> right down, forward
@@ -73,7 +74,7 @@ def _load_renderings(root_fp: str, subject_id: str, split: str, factor: float,sc
     path_image = "{}/images_{}".format(data_dir,scale)
     path_depth_image = "{}/depth_{}".format(data_dir,scale)
     image_fnames = sorted(os.listdir(path_image))
-    depth_image_fnames = sorted(os.listdir(path_depth_image))
+    # depth_image_fnames = sorted(os.listdir(path_depth_image))
     
     images = []
     camfromworld = []
@@ -144,7 +145,8 @@ class SubjectLoader(torch.utils.data.Dataset):
         "orchids",
         "room",
         "trex",
-        "fortress"
+        "fortress",
+        "garden"
     ]
 
 
@@ -166,7 +168,7 @@ class SubjectLoader(torch.utils.data.Dataset):
         assert split in self.SPLITS, "%s" % split
         assert subject_id in self.SUBJECT_IDS, "%s" % subject_id
         assert color_bkgd_aug in ["white", "black", "random"]
-        self.load_image_scale=4
+        self.load_image_scale=8
         self.split = split
         self.factor = factor
         self.color_bkgd_aug = color_bkgd_aug
@@ -203,7 +205,8 @@ class SubjectLoader(torch.utils.data.Dataset):
             ],
             dtype=torch.float32,
         )  # (3, 3)
-        self.images = images.to(device)
+        self.origin_images = images.to(device).to(torch.float32)
+        self.images = images.to(device).to(torch.float32)
         self.depths=depths.to(device)
         
         self.camfromworld = camfromworld.to(device)
@@ -217,6 +220,59 @@ class SubjectLoader(torch.utils.data.Dataset):
         
         self.progress=None
         self.outlier_idx=None
+        
+        
+        # for matching point 
+        with torch.no_grad():
+            self.macthing_k=3
+            self.k_matching_image_list=[[0 for _ in range(self.macthing_k)] for _ in range(len(self.images))]
+            self.extractor = SuperPoint(max_num_keypoints=2048).eval().to(device)  # load the extractor
+            self.matcher = LightGlue(features="superpoint").eval().to(device)
+            feats=[self.extractor.extract(rearrange(self.images[i,:,:,:3],'h w c -> c h w')/255.0) for i in range(len(self.images))]
+        # align the feature number
+        
+        minimum_feature_num=min([f['keypoints'].shape[1] for f in feats])
+        self.feats={}
+        
+        
+        for key in feats[0].keys():
+            # ic(key)
+            # ic(feats[0][key].shape)
+            for f in feats:
+                f[key]=f[key][:,:minimum_feature_num]
+            self.feats[key]=torch.cat([f[key] for f in feats],dim=0)
+            
+            # ic(self.feats[key].shape)
+        # self.feats=torch.cat([f['keypoints'][:,:minimum_feature_num] for f in feats],dim=0)
+        # ic("matching feat tensor : ", self.feats.shape)
+    def get_gaussian_kernel(self,kernel_size=127, sigma=10):
+        x_cord = torch.arange(kernel_size)
+        x_grid = x_cord.repeat(kernel_size).view(kernel_size, kernel_size)
+        y_grid = x_grid.t()
+        xy_grid = torch.stack([x_grid, y_grid], dim=-1).float()
+        mean = (kernel_size - 1)/2.
+        variance = sigma**2.
+        gaussian_kernel = (1./(2.*np.pi*variance)) * torch.exp(-torch.sum((xy_grid - mean)**2., dim=-1) / (2*variance))
+        return gaussian_kernel / gaussian_kernel.sum()
+    def set_smooth_image(self):
+        
+        # linear interpolation from 10 to 0
+        alpha=10*(1-np.clip(((self.progress)/0.15),0,1))
+        print(alpha)
+        if(alpha<=1e-4):
+            return
+        kernel=self.get_gaussian_kernel(31,alpha).to(self.origin_images.device)
+        self.images=torch_F.conv2d(self.origin_images.permute(0,3,1,2)/255.0, kernel.repeat(4,1,1,1),
+                                        bias=None, stride=1, padding="same", dilation=1, groups=4).permute(0,2,3,1)*255.0
+        
+        
+    def smooth_img_scheduler(self):
+        # linear decrease the sigma from 10 to 1
+        if self.progress is not None:
+            sigma=10*(1-self.progress)
+            self.images=self.get_smooth_image(self.images,127,sigma)
+        self.images=self.get_smooth_image(self.images,127,10)
+        
     def change_pyramid_img(self,level):
         '''
         level : [0,1,2,3]
@@ -317,6 +373,8 @@ class SubjectLoader(torch.utils.data.Dataset):
             y = torch.randint(
                 0, self.height, size=(self.num_rays,), device=self.images.device
             )
+            
+            
         
             
         else:
@@ -337,9 +395,9 @@ class SubjectLoader(torch.utils.data.Dataset):
         
         rgba = images[image_id, y, x] / 255.0
         
-        if self.training and self.progress is not None:
-            # ic(self.progress)
-            rgba= self.progress*rgba+(1- self.progress)*self.upper_level_images[image_id, y, x] / 255.0
+        # if self.training and self.progress is not None:
+        #     # ic(self.progress)
+        #     rgba= self.progress*rgba+(1- self.progress)*self.upper_level_images[image_id, y, x] / 255.0
 
         w2c = torch.reshape(self.camfromworld[image_id], (-1, 3, 4)) # [3, 4] or (num_rays, 3, 4)
         if self.training:
@@ -360,5 +418,46 @@ class SubjectLoader(torch.utils.data.Dataset):
                 "gt_w2c": w2c, # [num_images, 3, 4]
                 "image_id": image_id # [num_images]]
             }
+    @torch.no_grad()
+    def get_matching_point(self, noise_pose):
+        '''
+        intput :
+        noise_pose : [N,3,4]
+        
+        output :
+        matching_point : [B,N,2]   , N is determined by the least of matching points
+        '''
+        
+        
+        
+        
+        self.matcher.eval()
+        # find the k nearest camera for each image
+        noise_lie=SE3_to_se3(noise_pose)
+        dist_matrix=torch.norm(noise_lie[:,None,...]-noise_lie[None,...],dim=-1)
+        diag_idx=torch.arange(dist_matrix.shape[0])
+        dist_matrix[diag_idx,diag_idx]=1e10
+        values,indices=torch.topk(dist_matrix,self.macthing_k,dim=-1,largest=False)
+    
+        
+        # extract the feature for each image
+        with torch.no_grad():
+            matches01 = self.matcher({"image0": self.feats, "image1": self.feats})
+        # feats0, feats1, matches01 = [
+        #     rbd(x) for x in [feats0, feats1, matches01]
+        # ]  # remove batch dimension
 
+        # kpts0, kpts1, matches = feats0["keypoints"], feats1["keypoints"], matches01["matches"]
+        # m_kpts0, m_kpts1 = kpts0[matches[..., 0]], kpts1[matches[..., 1]]
+
+        # axes = viz2d.plot_images([image0, image1])
+        # viz2d.plot_matches(m_kpts0, m_kpts1, color="lime", lw=0.2)
+        # viz2d.add_text(0, f'Stop after {matches01["stop"]} layers', fs=20)
+
+        # kpc0, kpc1 = viz2d.cm_prune(matches01["prune0"]), viz2d.cm_prune(matches01["prune1"])
+        # viz2d.plot_images([image0, image1])
+        # viz2d.plot_keypoints([kpts0, kpts1], colors=[kpc0, kpc1], ps=10)
+        # keypoints = self.superpoint(image)
+        exit()
+        return keypoints
 

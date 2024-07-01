@@ -24,6 +24,190 @@ except ImportError as e:
     exit()
 from icecream import ic
 
+class _HashGradientScaler(torch.autograd.Function):  # typing: ignore
+    """
+    Scales the gradients of hash features based on a provided mask
+    """
+
+    @staticmethod
+    def forward(ctx, value, mask):
+        ctx.save_for_backward(mask)
+        return value, mask
+
+    @staticmethod
+    def backward(ctx, output_grad, grad_scaling):
+        (mask,) = ctx.saved_tensors
+        N = mask.shape[1]
+        D = mask.shape[2]
+        B = output_grad.shape[0]
+        in_shape = output_grad.shape
+        output_grad = (output_grad.view(B, N, D) * mask).view(*in_shape)
+        return output_grad, grad_scaling
+
+class ScaleHash(torch.nn.Module):
+    def __init__(
+        self,
+        aabb: Union[torch.Tensor, List[float]],
+        num_dim: int = 3,
+        num_layers: int = 2,
+        hidden_dim: int = 64,
+        num_layers_color: int = 3,
+        hidden_dim_color: int = 64,
+        n_features_per_level: int = 2,                                  # features_per_level
+        use_viewdirs: bool = True,
+        density_activation: Callable = lambda x: trunc_exp(x - 1),
+        base_resolution: int = 16,                                      # min_res
+        max_resolution: int = 2048,                                     # max_res
+        geo_feat_dim: int = 15,
+        n_levels: int = 16,                                             # num_levels
+        log2_hashmap_size: int = 19,                                    # log2_hashmap_size
+        c2f=None,                                                       # coarse_to_fine_iters
+        hash_init_scale: float = 0.001,                                 # hash_init_scale
+        implementation = "tcnn",                                        # implementation
+        interpolation = None,                                           # interpolation 
+    ) -> None:
+        # super().__init__(in_dim=num_dim)
+        super().__init__()
+        self.num_levels = n_levels
+        self.features_per_level = n_features_per_level
+        self.log2_hashmap_size = log2_hashmap_size
+        self.hash_table_size = 2**log2_hashmap_size
+        self.coarse_to_fine_iters = c2f
+        self.step = 0
+        
+        levels = torch.arange(n_levels)
+        growth_factor = np.exp((np.log(max_resolution) - np.log(base_resolution)) / (n_levels - 1)) if n_levels > 1 else 1
+        self.scalings = torch.floor(base_resolution * growth_factor**levels)
+
+        self.hash_offset = levels * self.hash_table_size
+
+        self.tcnn_encoding = None
+        self.hash_table = torch.empty(0)
+        
+        # if implementation == "tcnn" and not TCNN_EXISTS:
+        #     print_tcnn_speed_warning("HashEncoding")
+        #     implementation = "torch"
+        if implementation == "tcnn":
+            encoding_config = {
+                "otype": "HashGrid",
+                "n_levels": self.num_levels,
+                "n_features_per_level": self.features_per_level,
+                "log2_hashmap_size": self.log2_hashmap_size,
+                "base_resolution": base_resolution,
+                "per_level_scale": growth_factor,
+            }
+            if interpolation is not None:
+                encoding_config["interpolation"] = interpolation
+
+            self.tcnn_encoding = tcnn.Encoding(
+                n_input_dims=3,
+                encoding_config=encoding_config,
+            )
+        elif implementation == "torch":
+            self.hash_table = torch.rand(size=(self.hash_table_size * n_levels, n_features_per_level)) * 2 - 1
+            self.hash_table *= hash_init_scale
+            self.hash_table = torch.nn.Parameter(self.hash_table)
+            
+        if self.tcnn_encoding is None:
+            assert (
+                interpolation is None or interpolation == "Linear"
+            ), f"interpolation '{interpolation}' is not supported for torch encoding backend"
+            
+    def get_out_dim(self) -> int:
+        return self.num_levels * self.features_per_level
+
+    def set_step(self, step: int) -> None:
+        self.step = step
+    def hash_fn(self, in_tensor):
+        """Returns hash tensor using method described in Instant-NGP
+
+        Args:
+            in_tensor: Tensor to be hashed
+        """
+
+        # min_val = torch.min(in_tensor)
+        # max_val = torch.max(in_tensor)
+        # assert min_val >= 0.0
+        # assert max_val <= 1.0
+
+        in_tensor = in_tensor * torch.tensor([1, 2654435761, 805459861]).to(in_tensor.device)
+        x = torch.bitwise_xor(in_tensor[..., 0], in_tensor[..., 1])
+        x = torch.bitwise_xor(x, in_tensor[..., 2])
+        x %= self.hash_table_size
+        x += self.hash_offset.to(x.device)
+        return x
+    
+    def pytorch_fwd(self, in_tensor):
+        """Forward pass using pytorch. Significantly slower than TCNN implementation."""
+
+        assert in_tensor.shape[-1] == 3
+        in_tensor = in_tensor[..., None, :]  # [..., 1, 3]
+        scaled = in_tensor * self.scalings.view(-1, 1).to(in_tensor.device)  # [..., L, 3]
+        scaled_c = torch.ceil(scaled).type(torch.int32)
+        scaled_f = torch.floor(scaled).type(torch.int32)
+
+        offset = scaled - scaled_f
+
+        hashed_0 = self.hash_fn(scaled_c)  # [..., num_levels]
+        hashed_1 = self.hash_fn(torch.cat([scaled_c[..., 0:1], scaled_f[..., 1:2], scaled_c[..., 2:3]], dim=-1))
+        hashed_2 = self.hash_fn(torch.cat([scaled_f[..., 0:1], scaled_f[..., 1:2], scaled_c[..., 2:3]], dim=-1))
+        hashed_3 = self.hash_fn(torch.cat([scaled_f[..., 0:1], scaled_c[..., 1:2], scaled_c[..., 2:3]], dim=-1))
+        hashed_4 = self.hash_fn(torch.cat([scaled_c[..., 0:1], scaled_c[..., 1:2], scaled_f[..., 2:3]], dim=-1))
+        hashed_5 = self.hash_fn(torch.cat([scaled_c[..., 0:1], scaled_f[..., 1:2], scaled_f[..., 2:3]], dim=-1))
+        hashed_6 = self.hash_fn(scaled_f)
+        hashed_7 = self.hash_fn(torch.cat([scaled_f[..., 0:1], scaled_c[..., 1:2], scaled_f[..., 2:3]], dim=-1))
+
+        f_0 = self.hash_table[hashed_0]  # [..., num_levels, features_per_level]
+        f_1 = self.hash_table[hashed_1]
+        f_2 = self.hash_table[hashed_2]
+        f_3 = self.hash_table[hashed_3]
+        f_4 = self.hash_table[hashed_4]
+        f_5 = self.hash_table[hashed_5]
+        f_6 = self.hash_table[hashed_6]
+        f_7 = self.hash_table[hashed_7]
+
+        f_03 = f_0 * offset[..., 0:1] + f_3 * (1 - offset[..., 0:1])
+        f_12 = f_1 * offset[..., 0:1] + f_2 * (1 - offset[..., 0:1])
+        f_56 = f_5 * offset[..., 0:1] + f_6 * (1 - offset[..., 0:1])
+        f_47 = f_4 * offset[..., 0:1] + f_7 * (1 - offset[..., 0:1])
+
+        f0312 = f_03 * offset[..., 1:2] + f_12 * (1 - offset[..., 1:2])
+        f4756 = f_47 * offset[..., 1:2] + f_56 * (1 - offset[..., 1:2])
+
+        encoded_value = f0312 * offset[..., 2:3] + f4756 * (
+            1 - offset[..., 2:3]
+        )  # [..., num_levels, features_per_level]
+
+        return torch.flatten(encoded_value, start_dim=-2, end_dim=-1)  # [..., num_levels * features_per_level]
+    
+    def scale_grad_by_freq(self, outputs):
+        """Scale gradients by frequency of hash table entries"""
+        if self.coarse_to_fine_iters is None:
+            return outputs
+        B = outputs.shape[0]
+        N = self.num_levels
+        D = self.features_per_level
+        # formula for getting frequency mask
+        start, end = self.coarse_to_fine_iters
+        assert (
+            start >= 0 and end >= 0
+        ), f"start and end iterations for bundle adjustment have to be positive, got start = {start} and end = {end}"
+        L = N
+        # From https://arxiv.org/pdf/2104.06405.pdf equation 14
+        alpha = (self.step - start) / (end - start) * L
+        k = torch.arange(L, dtype=outputs.dtype, device=outputs.device)
+        mask_vals = (1.0 - (alpha - k).clamp_(min=0, max=1).mul_(np.pi).cos_()) / 2
+        mask_vals = mask_vals[None, ..., None].repeat((B, 1, D))
+        mask_vals[:,:,:2]=1.0
+        out, _ = _HashGradientScaler.apply(outputs, mask_vals)  # type: ignore
+        return out
+    
+    def forward(self, in_tensor):
+        if self.tcnn_encoding is not None:
+            out = self.tcnn_encoding(in_tensor)
+        else:
+            out = self.pytorch_fwd(in_tensor)
+        return self.scale_grad_by_freq(out)
 class _TruncExp(Function):  # pylint: disable=abstract-method
     # Implementation from torch-ngp:
     # https://github.com/ashawkey/torch-ngp/blob/93b08a0d4ec1cc6e69d85df7f0acdfb99603b628/activation.py
@@ -70,15 +254,15 @@ class NGPRadianceField(torch.nn.Module):
         self,
         aabb: Union[torch.Tensor, List[float]],
         num_dim: int = 3,
-        num_layers: int = 2,
+        num_layers: int = 3,
         hidden_dim: int = 64,
-        num_layers_color: int = 3,
+        num_layers_color: int = 2,
         hidden_dim_color: int = 64,
         n_features_per_level: int = 2, 
         use_viewdirs: bool = True,
         density_activation: Callable = lambda x: trunc_exp(x - 1),
         base_resolution: int = 16,
-        max_resolution: int = 4096,
+        max_resolution: int = 2048,
         geo_feat_dim: int = 15,
         n_levels: int = 16,
         log2_hashmap_size: int = 19,
@@ -159,11 +343,11 @@ class NGPRadianceField(torch.nn.Module):
             }
         
         self.encoding = tcnn.Encoding(n_input_dims=num_dim, encoding_config=mlp_encoding_config)
-        self.encoding2 = tcnn.Encoding(n_input_dims=num_dim, encoding_config=mlp_encoding_config)
+        # self.encoding2 = tcnn.Encoding(n_input_dims=num_dim, encoding_config=mlp_encoding_config)
         
         
         
-        self.mlp_base = tcnn.Network(n_input_dims=self.encoding.n_output_dims, 
+        self.mlp_base = tcnn.Network(n_input_dims=self.encoding.n_output_dims,
                                      n_output_dims=1 +self.geo_feat_dim,
                                      network_config=network_config) 
         
@@ -176,9 +360,9 @@ class NGPRadianceField(torch.nn.Module):
         )
         
         self.depth_mlp=torch.nn.Sequential(
-            torch.nn.Linear(6*6+3, 32),
+            torch.nn.Linear(4*6+3, 64),
             torch.nn.ReLU(),
-            torch.nn.Linear(32, 16),
+            torch.nn.Linear(64, 16),
             torch.nn.ReLU(),
             torch.nn.Linear(16, 1+ self.geo_feat_dim)
         )
@@ -203,6 +387,7 @@ class NGPRadianceField(torch.nn.Module):
                     "n_hidden_layers": num_layers_color - 1,
                 },
             )
+        self.encoding=ScaleHash(aabb,c2f=[0.0,0.5])
     def GaussianConv1d(self, x, kernel_size, stride=1, padding=0, dilation=1, groups=1):
         # x: [B, C, L]
         # kernel: [C, K]
@@ -219,57 +404,63 @@ class NGPRadianceField(torch.nn.Module):
         x = x.sum(-1)
         return x
 
+    
+    def gaussian_pdf(self,x, mu, sigma):
+        return torch.exp(-0.5 * ((x - mu) / sigma) ** 2) / (sigma * np.sqrt(2 * np.pi))
     def contract(self,x):
         mag = torch.linalg.norm(x, dim=-1)[..., None]
         return torch.where(mag < 1, x, (2 - (1 / mag)) * (x / mag))
     def query_density(self, x, weights:torch.Tensor = None, return_feat: bool = False):
         
-        # start,end = self.c2f
+        # start,end = 0.1,0.5
         # alpha = (self.progress.data-start)/(end-start)*4
-        # # x=self.contract(x)
-        # inverse_x=1/(x+1e-6)
+        # inverse_x=x
         # PE_x=self.positional_encoding(inverse_x.view(-1, self.num_dim),4,alpha)
         # PE_x=torch.cat([inverse_x,PE_x],dim=-1)
         
-        
-           
+        # coarse_f=self.depth_mlp(PE_x)
         aabb_min, aabb_max = torch.split(self.aabb, self.num_dim, dim=-1)
         
-        x=self.contract(x) # o [-2,2]
-        norm_x=torch.norm(x,dim=-1)
+        # x=(x-aabb_min*8)/(aabb_max*8-aabb_min*8)
+        
+        x=(self.contract(x)+2)/4 # o [-2,2]
+        # norm_x=torch.norm(x,dim=-1)
         # x=(x+2)/(4) # normalize
         # x = (x - aabb_min) / (aabb_max - aabb_min) # normalize
         encoded_x = self.encoding(x.view(-1, self.num_dim)) # [N,32]
-        
+        self.encoded_x=encoded_x
+        # encoded_x=torch.cat([encoded_x,PE_x],dim=-1)
         # 
         
         # encoded_x[norm_x>=1] = self.encoding2(x[norm_x>=1].view(-1, self.num_dim)) # [N,32]
-        if weights is not None:
-            _, n_features = encoded_x.shape
-            assert n_features == len(weights)
-            # repeats last set of features for 0 mask levels.
+        # if weights is not None:
+        #     encoded_x = encoded_x * weights
+        #     _, n_features = encoded_x.shape
+        #     assert n_features == len(weights)
+        #     # repeats last set of features for 0 mask levels.
         
-            available_features = encoded_x[:, weights > 0]
+        #     available_features = encoded_x[:, weights > 0]
             
-            if len(available_features) <= 0:
-                assert False, "no features are selected!"
-            assert len(available_features) > 0
+        #     if len(available_features) <= 0:
+        #         assert False, "no features are selected!"
+        #     assert len(available_features) > 0
             
-            # BAA's simple update rule
+        #     # BAA's simple update rule
             
-            # coarse_features = available_features[:, -self.n_features_per_level:]
-            # coarse_repeats = coarse_features.repeat(1, self.n_levels)
-            # encoded_x = encoded_x * weights + coarse_repeats * (1 - weights) 
+        #     coarse_features = available_features[:, -self.n_features_per_level:]
+        #     coarse_repeats = coarse_features.repeat(1, self.n_levels)
+        #     weights+=0.1
+        #     encoded_x = encoded_x * weights + coarse_repeats * (1 - weights) 
             
             # revise smooth interpolation
-            current_level=available_features.size(1)
-            if current_level>=4:
-                w=weights[current_level-1]
-                coarse_features = w*available_features[:, -self.n_features_per_level:] + (1-w)*available_features[:, -self.n_features_per_level-2:-self.n_features_per_level]
-            else:
-                coarse_features = available_features[:, -self.n_features_per_level:]
-            coarse_repeats = coarse_features.repeat(1, self.n_levels)
-            encoded_x = encoded_x * weights + coarse_repeats * (1 - weights) 
+            # current_level=available_features.size(1)
+            # if current_level>=4:
+            #     w=weights[current_level-1]
+            #     coarse_features = w*available_features[:, -self.n_features_per_level:] + (1-w)*available_features[:, -self.n_features_per_level-2:-self.n_features_per_level]
+            # else:
+            #     coarse_features = available_features[:, -self.n_features_per_level:]
+            # coarse_repeats = coarse_features.repeat(1, self.n_levels)
+            # encoded_x = encoded_x * weights + coarse_repeats * (1 - weights) 
 
         # encoded_x=torch.cat([encoded_x,PE_x],dim=-1)
         # encoded_x=encoded_x.to(torch.float32)
@@ -279,6 +470,20 @@ class NGPRadianceField(torch.nn.Module):
         # ic(encoded_x.shape)
         # encoded_x=torch.cat([encoded_x,PE_x],dim=-1)
         # ic(encoded_x.shape)
+        # encoded_x[norm_x>=1] = self.encoding2(x[norm_x>=1].view(-1, self.num_dim)) # [N,32]
+            # noise_x=x.view(-1, self.num_dim)+torch.randn_like(x)*((1-alpha).clip(0,0.01))
+            # normal_encoded_x = self.encoding(noise_x) # [N,32]
+            # available_features = normal_encoded_x[:, weights > 0]
+            # coarse_features = available_features[:, -self.n_features_per_level:]
+            # coarse_repeats = coarse_features.repeat(1, self.n_levels)
+            # normal_encoded_x = normal_encoded_x * weights + coarse_repeats * (1 - weights) 
+            
+            
+            # w1=self.gaussian_pdf(encoded_x.to(torch.float32), encoded_x.to(torch.float32), (1-alpha).clip(0,0.01))
+            # w2=self.gaussian_pdf(normal_encoded_x.to(torch.float32), encoded_x.to(torch.float32), (1-alpha).clip(0,0.01))
+            # w=w1+w2
+            # encoded_x=encoded_x.to(torch.float32)*w1/w+normal_encoded_x.to(torch.float32)*w2/w
+            
         x = (
             self.mlp_base(encoded_x)
             .view(list(x.shape[:-1]) + [1 + self.geo_feat_dim])
@@ -304,9 +509,9 @@ class NGPRadianceField(torch.nn.Module):
         #     self.density_activation(density_before_activation_guide)
         # )
         if return_feat:
-            return density, base_mlp_out#+encoded_x+base_mlp_out_guide*density_guide*density_guide
+            return density, base_mlp_out#+base_mlp_out_guide
         else:
-            return density
+            return density#*density_guide
 
     def _query_rgb(self, dir, embedding, apply_act: bool = True):
         # tcnn requires directions in the range [0, 1]

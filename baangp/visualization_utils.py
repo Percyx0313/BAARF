@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 def plot_save_poses_llff(fig,pose,pose_ref=None,path=None,ep=None):
     # get the camera meshes
-    cam_depth=0.1
+    cam_depth=0.5
     _,_,cam = get_camera_mesh(pose,depth=cam_depth)
     cam = cam.numpy()
     if pose_ref is not None:
@@ -40,15 +40,15 @@ def plot_save_poses_llff(fig,pose,pose_ref=None,path=None,ep=None):
             ax1.scatter(cam_ref[i,5,0],cam_ref[i,5,1],cam_ref[i,5,2],color=(0.3,0.3,0.3),s=40)
             ax2.scatter(cam_ref[i,5,0],cam_ref[i,5,1],cam_ref[i,5,2],color=(0.3,0.3,0.3),s=40)
         c = np.array(color(float(i)/N))*0.8
-        ax1.plot(cam[i,:,0],cam[i,:,1],cam[i,:,2],color=pred_color)
-        ax2.plot(cam[i,:,0],cam[i,:,1],cam[i,:,2],color=pred_color)
+        ax1.plot(cam[i,:,0],cam[i,:,1],cam[i,:,2],color=c)
+        ax2.plot(cam[i,:,0],cam[i,:,1],cam[i,:,2],color=c)
         
         # plot the oriantation of the camera
-        ax1.plot(cam[i,:2,0], cam[i,:2,1], cam[i,:2,2], color=(0,0,1.0), linewidth=2)
-        ax2.plot(cam[i,:2,0], cam[i,:2,1], cam[i,:2,2], color=(0,0,1.0), linewidth=2)
+        # ax1.plot(cam[i,:2,0], cam[i,:2,1], cam[i,:2,2], color=(0,0,1.0), linewidth=2)
+        # ax2.plot(cam[i,:2,0], cam[i,:2,1], cam[i,:2,2], color=(0,0,1.0), linewidth=2)
         
-        ax1.scatter(cam[i,5,0],cam[i,5,1],cam[i,5,2],color=pred_color,s=40)
-        ax2.scatter(cam[i,5,0],cam[i,5,1],cam[i,5,2],color=pred_color,s=40)
+        ax1.scatter(cam[i,5,0],cam[i,5,1],cam[i,5,2],color=c,s=40)
+        ax2.scatter(cam[i,5,0],cam[i,5,1],cam[i,5,2],color=c,s=40)
     for i in range(N):
         ax1.plot([cam[i,5,0],cam_ref[i,5,0]],
                 [cam[i,5,1],cam_ref[i,5,1]],

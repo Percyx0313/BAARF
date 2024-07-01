@@ -111,7 +111,6 @@ def validate(models , train_dataset, test_dataset,step=0):
                       dataset='llff',
                       optim_pose=args.optim_pose)
         
-        ic(sim3.t0, sim3.t1, sim3.s0, sim3.s1, sim3.R)
         print("--------------------------")
         print("{} train rot error:   {:8.3f}".format(step, rot_error)) # to use numpy, the value needs to be on cpu first.
         print("{} train trans error: {:10.5f}".format(step, trans_error))
@@ -169,7 +168,7 @@ def validate(models , train_dataset, test_dataset,step=0):
                 alpha_thre=alpha_thre,
             )
             # evaluate view synthesis
-            invdepth = 1/ depth
+            invdepth = 1/ (depth+1e-8)
             loaded_pixels = data["pixels"]
             h, w, c = loaded_pixels.shape
             pixels = loaded_pixels.permute(2, 0, 1)
@@ -305,23 +304,23 @@ if __name__ == "__main__":
     lr = 1.e-2  if args.dataset=='blender' else  1.e-2
     lr_end = 1.e-4 if args.dataset=='blender' else 1.e-4
     lr_pose_R = 3.e-3 if args.dataset=='blender' else  3.e-3#1.e-2
-    lr_pose_T = 5.e-3 if args.dataset=='blender' else  3.e-3#1.e-2
+    lr_pose_T = 5.e-3 if args.dataset=='blender' else  5.e-3#1.e-2
     optim_lr_pose = 1.e-4
-    max_steps = 40000 if args.dataset=='blender' else 20000
-    init_batch_size = 1024
+    max_steps = 40000 if args.dataset=='blender' else 40000
+    init_batch_size = 256
     target_sample_batch_size = 1 << 18
     weight_decay = 1e-6
-    warm_up_steps=100
+    warm_up_steps=256
           
     # model parameters
     grid_resolution = 128
-    grid_nlvl = 1
+    grid_nlvl = 4
     # render parameters
-    alpha_thre = 0 #@0.01
+    alpha_thre = 0
     cone_angle = 0.004
 
     #
-    ema_alpha=0.9
+    ema_alpha=0.9 if args.dataset=='blender' else 0.6
     ema_ratio=(0.99/ema_alpha)**(1/(max_steps/4))
     # init wandb
     
@@ -376,7 +375,7 @@ if __name__ == "__main__":
         grid_nlvl = 4
         
         aabb = torch.tensor([-aabb_scale, -aabb_scale, -aabb_scale, aabb_scale, aabb_scale, aabb_scale], device=device)
-        near_plane = 0.05
+        near_plane = 0.01
         ic(aabb_scale)
         far_plane =1000
     elif args.dataset=='blender':
@@ -386,7 +385,7 @@ if __name__ == "__main__":
     else:
         assert False,"Need to give the known dataset"
     
-    render_step_size = 5e-3 if args.dataset=='blender' else ((aabb[3:] - aabb[:3]) ** 2).sum().sqrt().item() / 1000 
+    render_step_size = 1e-2  if args.dataset=='blender' else ((aabb[3:] - aabb[:3]) ** 2).sum().sqrt().item() / 1000 
     target_render_step_size = 5e-3 if args.dataset=='blender' else 5e-3
     
     # re-localization 
@@ -450,11 +449,11 @@ if __name__ == "__main__":
         pose_optimizer = torch.optim.Adam(
             [{'params':models['radiance_field'].se3_refine_R.parameters(), 'lr':lr_pose_R},
             {'params':models['radiance_field'].se3_refine_T.parameters(), 'lr':lr_pose_T}],betas=[0.9,0.99])
-        pose_scheduler = torch.optim.lr_scheduler.ExponentialLR(
-            pose_optimizer,
-            gamma=(1.e-2)**(1./max_steps)
-        )
-        schedulers["pose_scheduler"] = pose_scheduler
+        # pose_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+        # #     pose_optimizer,
+        # #     gamma=(1.e-2)**(1./max_steps)
+        # # )
+        # schedulers["pose_scheduler"] = pose_scheduler
         optimizers["pose_optimizer"] = pose_optimizer
 
     lpips_net = LPIPS(net="vgg").to(device)
@@ -479,13 +478,16 @@ if __name__ == "__main__":
             # linear increase the step size
             # render_step_size = render_step_size + (target_render_step_size - render_step_size) * step / max_steps
             
+            if(step%500==0):
+                ic("change the gaussian kernel")
+                train_dataset.set_smooth_image()
+            # if (step//2500)>(3-current_pyramid_level) and current_pyramid_level>0:
+            #     current_pyramid_level-=1
+            #     train_dataset.change_pyramid_img(level=current_pyramid_level)
+            #     print(f"Update pyramid level to {current_pyramid_level}")
+            # train_dataset.progress = min(train_dataset.progress+1/2500,1)
             
-            if (step//2500)>(3-current_pyramid_level) and current_pyramid_level>0:
-                current_pyramid_level-=1
-                train_dataset.change_pyramid_img(level=current_pyramid_level)
-                print(f"Update pyramid level to {current_pyramid_level}")
-            train_dataset.progress = min(train_dataset.progress+1/2500,1)
-            
+            train_dataset.progress = min(train_dataset.progress+1/max_steps,1)
             
             i = torch.randint(0, len(train_dataset), (1,)).item()
             data = train_dataset[i]
@@ -495,7 +497,6 @@ if __name__ == "__main__":
             grid_3D = data["grid_3D"]
             gt_poses = data["gt_w2c"] # [num_ray, 3, 4]
             image_ids = data["image_id"]
-            
             
             if args.c2f is not None:
                 models["radiance_field"].update_progress(step/max_steps)
@@ -526,11 +527,20 @@ if __name__ == "__main__":
                 rays=rays,
                 # rendering options
                 near_plane=near_plane,
+                far_plane=far_plane,
                 render_step_size=render_step_size,
                 render_bkgd=render_bkgd,
                 cone_angle=cone_angle,
                 alpha_thre=alpha_thre,
             )
+            
+            
+            
+            
+            
+            # get the natching point
+            noise_pose=models["radiance_field"].get_all_noise_pose(train_dataset.camfromworld)
+            train_dataset.get_matching_point(noise_pose)
             
             
             # print(rgb.shape,depth.shape)
@@ -557,7 +567,9 @@ if __name__ == "__main__":
             # smaple_id=torch.randint(0,models["radiance_field"].nerf.density.shape[0]-1,(1024,))
             # smaple_density_distance=models["radiance_field"].nerf.density[smaple_id]-models["radiance_field"].nerf.density[smaple_id+1]
             # density_reg=(smaple_density_distance.abs()).mean()*0.05
-            loss = F.smooth_l1_loss(rgb, pixels)#+density_reg#-0.001*torch.mean(alphas_t*torch.log(alphas_t+1e-8)+(1-alphas_t)*torch.log((1-alphas_t)+1e-8))#+0.001*feat_reg#+consistency_loss
+            
+            # bk_loss=torch.mean((rgb-render_bkgd)**2)
+            loss = F.smooth_l1_loss(rgb, pixels)#+torch.mean(torch.abs(models["radiance_field"].nerf.encoded_x))*0.01#@+bk_loss*0.01#+density_reg#-0.001*torch.mean(alphas_t*torch.log(alphas_t+1e-8)+(1-alphas_t)*torch.log((1-alphas_t)+1e-8))#+0.001*feat_reg#+consistency_loss
             # ic(loss)
             # s3im loss
             
@@ -802,6 +814,7 @@ if __name__ == "__main__":
                         f"elapsed_time={elapsed_time:.2f}s | step={step} | "
                         f"loss={loss:.5f} | psnr={psnr:.2f} | "
                         f"n_rendering_samples={n_rendering_samples:d} | num_rays={len(pixels):d} | "
+                        f"min_depth={depth.min():.3f} | "
                         f"max_depth={depth.max():.3f} | "
                     )
                     
