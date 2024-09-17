@@ -22,7 +22,7 @@ except ImportError as e:
         "pip install git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch"
     )
     exit()
-
+from icecream import ic
 
 class _TruncExp(Function):  # pylint: disable=abstract-method
     # Implementation from torch-ngp:
@@ -50,16 +50,19 @@ def random_weight_matrix(scale,alpha):
     weight_matrix=torch.nn.functional.normalize(weight_matrix,dim=1)
     print(weight_matrix)
     return weight_matrix
-# def consistency_weight_matrix(weight):
-#     weight=torch.diag(1-weight).view(32,32).to('cuda').half()
-#     weight[]
-#     # weight_matrix=torch.FloatTensor(
-#     #         [[[ (1-weight[j]) if (j in {i,i-1} and weight[i]<1) else 0 ] for j in range(32) ] for i in range(32)]
-#     #     ).view(32,32).to('cuda').half()
-#     # print(weight_matrix)
-#     exit()
-    # weight_matrix=torch.nn.functional.normalize(weight_matrix,dim=1)
-    return weight_matrix
+
+# resnet block
+class ResnetBlock(torch.nn.Module):
+    def __init__(self, in_features, out_features):
+        super(ResnetBlock, self).__init__()
+        self.block = torch.nn.Sequential(
+            torch.nn.Linear(in_features, out_features),
+        )
+
+    def forward(self, x):
+        return x + self.block(x)
+
+
 class NGPRadianceField(torch.nn.Module):
     """Instance-NGP Radiance Field"""
 
@@ -137,6 +140,7 @@ class NGPRadianceField(torch.nn.Module):
                     ],
                 },
             )
+            
 
         mlp_encoding_config = {
                 "otype": "HashGrid",
@@ -153,10 +157,32 @@ class NGPRadianceField(torch.nn.Module):
                 "n_neurons": hidden_dim,
                 "n_hidden_layers": num_layers - 1,
             }
+        
         self.encoding = tcnn.Encoding(n_input_dims=num_dim, encoding_config=mlp_encoding_config)
-        self.mlp_base = tcnn.Network(n_input_dims=self.encoding.n_output_dims, 
-                                     n_output_dims=1 + self.geo_feat_dim,
+        
+        
+        
+        self.mlp_base = tcnn.Network(n_input_dims=self.encoding.n_output_dims,#+8*6+3, 
+                                     n_output_dims=1 +self.geo_feat_dim,
                                      network_config=network_config) 
+        
+        self.mlp_base_torch=torch.nn.Sequential(
+            ResnetBlock(self.encoding.n_output_dims, self.geo_feat_dim),
+            torch.nn.ReLU(),
+            ResnetBlock(self.geo_feat_dim, self.geo_feat_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(self.geo_feat_dim, 1 + self.geo_feat_dim)
+        )
+        
+        self.depth_mlp=torch.nn.Sequential(
+            torch.nn.Linear(6*6+3, 32),
+            torch.nn.ReLU(),
+            torch.nn.Linear(32, 16),
+            torch.nn.ReLU(),
+            torch.nn.Linear(16, 1+ self.geo_feat_dim)
+        )
+        
+        
         if self.geo_feat_dim > 0:
             self.mlp_head = tcnn.Network(
                 n_input_dims=(
@@ -177,40 +203,50 @@ class NGPRadianceField(torch.nn.Module):
                 },
             )
 
-        self.smooth_mlp=tcnn.Network(
-            n_input_dims=3+3*4*2,
-            n_output_dims=16,
-            network_config={
-                "otype": "FullyFusedMLP",
-                "activation": "ReLU",
-                "output_activation": "None",
-                "n_neurons": 32,
-                "n_hidden_layers": 2,
-            },
-        )
     def query_density(self, x, weights:torch.Tensor = None, return_feat: bool = False):
         
-        # PE_x=self.positional_encoding(x.view(-1, self.num_dim),4)
-        # PE_x=torch.cat([x,PE_x],dim=-1)
+        start,end = self.c2f
+        alpha = (self.progress.data-start)/(end-start)*4
+        PE_x=self.positional_encoding(x.view(-1, self.num_dim),6)
+        PE_x=torch.cat([x,PE_x],dim=-1)
+        
+        
+           
         aabb_min, aabb_max = torch.split(self.aabb, self.num_dim, dim=-1)
         x = (x - aabb_min) / (aabb_max - aabb_min) # normalize
+        
         encoded_x = self.encoding(x.view(-1, self.num_dim)) # [N,32]
-        # self.var_loss=
         if weights is not None:
             _, n_features = encoded_x.shape
             assert n_features == len(weights)
             # repeats last set of features for 0 mask levels.
         
             available_features = encoded_x[:, weights > 0]
+            
             if len(available_features) <= 0:
                 assert False, "no features are selected!"
             assert len(available_features) > 0
-            coarse_features = available_features[:, -self.n_features_per_level:]
+            
+            # BAA's simple update rule
+            
+            # coarse_features = available_features[:, -self.n_features_per_level:]
+            # coarse_repeats = coarse_features.repeat(1, self.n_levels)
+            # encoded_x = encoded_x * weights + coarse_repeats * (1 - weights) 
+            
+            # revise smooth interpolation
+            current_level=available_features.size(1)
+            if current_level>=4:
+                w=weights[current_level-1]
+                coarse_features = w*available_features[:, -self.n_features_per_level:] + (1-w)*available_features[:, -self.n_features_per_level-2:-self.n_features_per_level]
+            else:
+                coarse_features = available_features[:, -self.n_features_per_level:]
             coarse_repeats = coarse_features.repeat(1, self.n_levels)
             encoded_x = encoded_x * weights + coarse_repeats * (1 - weights) 
 
+        # encoded_x=torch.cat([encoded_x,PE_x],dim=-1)
+        encoded_x=encoded_x.to(torch.float32)
         x = (
-            self.mlp_base(encoded_x)
+            self.mlp_base_torch(encoded_x)
             .view(list(x.shape[:-1]) + [1 + self.geo_feat_dim])
             .to(x)
         )
@@ -219,13 +255,24 @@ class NGPRadianceField(torch.nn.Module):
         density_before_activation, base_mlp_out = torch.split(
             x, [1, self.geo_feat_dim], dim=-1
         )
+        
+        
         density = (
             self.density_activation(density_before_activation)
         )
+        
+        
+        x_guide=self.depth_mlp(PE_x)
+        density_before_activation_guide, base_mlp_out_guide = torch.split(
+            x_guide, [1, self.geo_feat_dim], dim=-1
+        )
+        density_guide = (
+            self.density_activation(density_before_activation_guide)
+        )
         if return_feat:
-            return density, base_mlp_out
+            return density*density_guide, base_mlp_out+encoded_x+base_mlp_out_guide
         else:
-            return density
+            return density*density_guide
 
     def _query_rgb(self, dir, embedding, apply_act: bool = True):
         # tcnn requires directions in the range [0, 1]
@@ -262,11 +309,10 @@ class NGPRadianceField(torch.nn.Module):
     def positional_encoding(self,positions, freqs, progress=1.0):
         levels = torch.arange(freqs, device=positions.device)
         freq_bands = (2**levels)  # (F,)
-        # mask = (progress * freqs - levels).clamp_(min=0.0, max=1) # linear anealing
+        mask = (progress * freqs - levels).clamp_(min=0.0, max=1) # linear anealing
         pts = positions[..., None] * freq_bands
-        pts_sin = torch.sin(pts)#*mask
-        pts_cos = torch.cos(pts)#*mask
+        pts_sin = torch.sin(pts)*mask
+        pts_cos = torch.cos(pts)*mask
         pts = torch.cat([pts_sin , pts_cos], dim=-1)
-        pts = pts.reshape(
-            positions.shape[:-1] + (freqs * 2 * positions.shape[-1], ))  # (..., DF)
+        pts = pts.reshape(positions.shape[:-1] + (freqs * 2 * positions.shape[-1], ))  # (..., DF)
         return pts

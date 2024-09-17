@@ -10,7 +10,7 @@ from .ngp import NGPRadianceField
 
 sys.path.append("..")
 from camera_utils import cam2world
-from lie_utils import se3_to_SE3
+from lie_utils import se3_to_SE3,so3_t3_to_SE3
 from pose_utils import construct_pose, compose_poses
 from utils import Rays
 
@@ -27,7 +27,7 @@ class BAradianceField(torch.nn.Module):
         n_levels: int = 16,
         n_features_per_level: int = 2, 
         log2_hashmap_size: int = 19,
-        base_resolution: int = 14,
+        base_resolution: int = 16,
         max_resolution: int = 4096,
         use_viewdirs: bool = True,
         c2f: typing.Optional[float] = None,
@@ -35,6 +35,7 @@ class BAradianceField(torch.nn.Module):
         num_input_dim: int = 3,
         device: str = 'cpu',
         testing: bool = False,
+        dataset: str ='blender'
     ) -> None:
         super().__init__()
         
@@ -52,16 +53,19 @@ class BAradianceField(torch.nn.Module):
                                      n_features_per_level=n_features_per_level,
                                      max_resolution=max_resolution,                              
                                      use_viewdirs=use_viewdirs,
-                                     c2f=c2f)
+                                     c2f=c2f,
+                                     )
         self.c2f = c2f
 
         # noise addition for blender.
         
-        se3_noise = torch.randn(num_frame, dof, device=device) * 0.15
+        se3_noise = torch.randn(num_frame, dof, device=device) *0.15  #0.15
         self.pose_noise = se3_to_SE3(se3_noise)
         # Learnable embedding. 
-        self.se3_refine = torch.nn.Embedding(num_frame, dof, device=device)
-        torch.nn.init.zeros_(self.se3_refine.weight)
+        self.se3_refine_R = torch.nn.Embedding(num_frame, dof//2, device=device)
+        self.se3_refine_T = torch.nn.Embedding(num_frame, dof//2, device=device)
+        torch.nn.init.zeros_(self.se3_refine_R.weight)
+        torch.nn.init.zeros_(self.se3_refine_T.weight)
         # TODO:see if we want to register buffer for this variable.
         self.progress = torch.nn.Parameter(torch.tensor(0.))
         self.k = torch.arange(n_levels-1, dtype=torch.float32, device=device)
@@ -69,6 +73,9 @@ class BAradianceField(torch.nn.Module):
         self.n_features_per_level = n_features_per_level
         self.device = device
         self.testing = testing
+        # for LLFF
+        self.pose_eye = torch.eye(3,4).to(device).detach()
+        self.dataset= dataset
 
     def query_density(self, x, occ_sample=False):
         if self.c2f is None or (self.testing and not occ_sample):
@@ -91,16 +98,33 @@ class BAradianceField(torch.nn.Module):
         return self.nerf(positions, directions, weights=self.get_weights())
 
     def get_poses(self, idx=None, sim3=None, gt_poses=None, pose_refine_test=None, test_photo=True, mode='train'):
+        
         if mode=='train':
             assert self.training, 'set mode to train during non-training time.'
-            pose_noises = self.pose_noise[idx]
-            init_poses = compose_poses([pose_noises, gt_poses])
-            # add learnable pose correction
-            assert idx is not None, "idx cannot be None during training."
-            se3_refine = self.se3_refine.weight[idx] # [B, 6] idx corresponds to frame number.
-            poses_refine = se3_to_SE3(se3_refine) # [1, 3, 4]
-            # add learnable pose correction
-            poses = compose_poses([poses_refine, init_poses])
+            
+            if self.dataset=="blender":
+                pose_noises = self.pose_noise[idx]
+                init_poses = compose_poses([pose_noises, gt_poses])
+                # add learnable pose correction
+                assert idx is not None, "idx cannot be None during training."
+                se3_refine_R = self.se3_refine_R.weight[idx] # [B, 3] idx corresponds to frame number.
+                se3_refine_T = self.se3_refine_T.weight[idx] # [B, 3] idx corresponds to frame number.
+                # se3_refine= torch.cat([se3_refine_R, se3_refine_T], dim=-1) # [B, 3]
+                poses_refine = so3_t3_to_SE3(se3_refine_R,se3_refine_T) # [1, 3, 4]
+                # add learnable pose correction
+                poses = compose_poses([poses_refine, init_poses])
+            else:
+                # pose_noises = self.pose_noise[idx]
+                # init_poses = compose_poses([pose_noises, gt_poses])
+                init_poses=self.pose_eye
+                # add learnable pose correction
+                assert idx is not None, "idx cannot be None during training."
+                se3_refine_R = self.se3_refine_R.weight[idx] # [B, 3] idx corresponds to frame number.
+                se3_refine_T = self.se3_refine_T.weight[idx] # [B, 3] idx corresponds to frame number.
+                # se3_refine= torch.cat([se3_refine_R, se3_refine_T], dim=-1) # [B, 3]
+                poses_refine = so3_t3_to_SE3(se3_refine_R,se3_refine_T) # [1, 3, 4]
+                # add learnable pose correction
+                poses = compose_poses([poses_refine, init_poses])
         elif mode in ['val', 'eval', 'test-optim']:
             assert sim3 is not None, 'val, eval, test-optim needs sim3.'
             # align test pose to refined coordinate system (up to sim3)
@@ -151,4 +175,7 @@ class BAradianceField(torch.nn.Module):
     def update_progress(self, progress):
         self.progress.data.fill_(progress)
         self.nerf.progress.data.fill_(progress)
+    def get_refine_se3(self):
+        se3_refine= torch.cat([self.se3_refine_R.weight, self.se3_refine_T.weight], dim=-1) # [B, 6]
+        return se3_refine
 

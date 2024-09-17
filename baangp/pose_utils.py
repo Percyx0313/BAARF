@@ -66,3 +66,12 @@ def compose_pair(pose_a, pose_b):
     t_new = (R_b@t_a+t_b)[...,0]
     pose_new = construct_pose(R=R_new,t=t_new)
     return pose_new
+def compose_split(pose_a, pose_b):
+    # pose_new(x) = pose_b o pose_a(x)
+    R_a,t_a = pose_a[...,:3], pose_a[...,3:]
+    R_b,t_b = pose_b[...,:3], pose_b[...,3:]
+    R_new = R_b@R_a
+    t_new = (t_a+t_b)[...,0]
+    pose_new = construct_pose(R=R_new,t=t_new)
+    return pose_new
+
